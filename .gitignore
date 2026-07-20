@@ -1,3 +1,6 @@
 
 # Large TPU trace files (>100MB, stored in GCS)
 **/trace_events.json
+
+__pycache__/
+*.pyc

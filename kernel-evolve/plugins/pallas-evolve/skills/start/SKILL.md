@@ -1,11 +1,11 @@
 ---
 name: start
-description: Use when starting a Pallas kernel optimization session on TPU v7x — reads config, verifies baseline, creates tracking Issue, runs profile-informed think-submit-analyze-reflect-compact loop with lineage tracking
+description: Use when starting a Pallas kernel optimization session on a TPU-VM (v6e) over SSH — reads config, verifies baseline, creates tracking Issue, runs profile-informed think-submit-analyze-reflect-compact loop with lineage tracking
 ---
 
 # Pallas Kernel Batch Optimization
 
-Optimize a Pallas TPU kernel through batch evolutionary mutation with lineage tracking. Each round generates N variants exploring genuinely different TECHNICAL DIRECTIONS, evaluates them serially in a single GKE Pod, selects top-K as surviving lineages, and iterates. You are the optimization brain.
+Optimize a Pallas TPU kernel through batch evolutionary mutation with lineage tracking. Each round generates N variants exploring genuinely different TECHNICAL DIRECTIONS, evaluates them serially on a TPU-VM over SSH, selects top-K as surviving lineages, and iterates. You are the optimization brain.
 
 ## Arguments
 
@@ -36,7 +36,7 @@ Execute these steps in order:
    - `## Failure Patterns` — known errors and how to avoid them. **You MUST avoid these.**
    - `## Successful Optimizations` — proven strategies. **Prioritize these.**
 
-6. **Check kubectl and baseline**: Run `kubectl cluster-info` to verify connectivity to the GKE cluster. Then verify baseline profiling exists:
+6. **Check SSH and baseline**: Verify connectivity to the TPU-VM and that it sees the TPU: `ssh -i {evaluator.ssh_key} {evaluator.ssh_user}@{evaluator.ssh_host} "{evaluator.ssh_python} -c 'import jax; print(jax.devices())'"` (should list TPU devices; if the host is unreachable, the worker IP may be stale — re-discover with gcloud). Then verify baseline profiling exists:
 
    ```bash
    ls kernel-evolve/examples/kernels/{kernel_name}_baseline/eval_result.json
@@ -52,7 +52,7 @@ Execute these steps in order:
    ```bash
    gh issue create \
      --title "[pallas-evolve] Optimize {kernel_name}" \
-     --body "Optimizing {kernel_name} kernel for TPU v7x (batch evolution).\n\nConfig: {config_path}\nShapes: {shapes}\nMax iterations: {max_iterations}\nVariants per round: {variants_per_round}\nTop-K: {top_k}" \
+     --body "Optimizing {kernel_name} kernel for TPU v6e (batch evolution).\n\nConfig: {config_path}\nShapes: {shapes}\nMax iterations: {max_iterations}\nVariants per round: {variants_per_round}\nTop-K: {top_k}" \
      --label pallas-evolve
    ```
    Save the issue number from the output.
@@ -122,7 +122,7 @@ Generate N variants from the baseline kernel, each exploring a DIFFERENT technic
    - The full template kernel content
    - The AGENT.md failure patterns and successful optimizations
    - Its assigned direction name (derived from the profile brief in step 3 above)
-   - The TPU v7x hard rules and optimization knowledge from this skill
+   - The TPU v6e hard rules and optimization knowledge from this skill
    - **The profile brief content** (full text of `iteration_1/profile_brief.md` generated in Phase 0), including hardware utilization, bottleneck diagnosis, LLO key observations, and optimization priorities
    - **Direction-specific guidance**: Based on the profile brief's bottleneck diagnosis, explain what specific profile signal motivates this sub-agent's direction and what concrete optimization it should attempt. For example: "The profile shows compute_ratio=0.35 (memory-bound) with no double buffering. Your direction `dma_prefetch` should focus on adding DMA prefetch to hide the 65% memory transfer time visible in the LLO trace."
    - The output path: `iteration_1/variants/{direction_name}/kernel.py`
@@ -167,7 +167,7 @@ Generate N variants from the baseline kernel, each exploring a DIFFERENT technic
    - The base kernel content (from its assigned lineage's `best_kernel`)
    - The AGENT.md failure patterns and successful optimizations
    - Its assigned direction and lineage context (lineage ID, previous best speedup, prior direction)
-   - The TPU v7x hard rules and optimization knowledge from this skill
+   - The TPU v6e hard rules and optimization knowledge from this skill
    - **The profile brief content** (full text of `iteration_{N}/profile_brief.md`), including the delta vs baseline table, hardware utilization, bottleneck diagnosis, and LLO key observations
    - **Direction-specific guidance**: Based on the profile brief's bottleneck diagnosis, explain what specific profile signal motivates this direction and what concrete optimization it should attempt, referencing what changed since the previous round
    - The output path: `iteration_{N}/variants/{variant_name}/kernel.py`
@@ -201,9 +201,10 @@ Invoke `pallas-evolve:submit` via the Skill tool.
 
 The submit skill will:
 - Collect all variant kernels into a batch payload
-- Create a single K8s Job that evaluates all variants serially via subprocess isolation
-- Parse multiple `EVAL_RESULT:` lines from the Job logs
+- Stage it on the TPU-VM and run evaluate.py over SSH, evaluating all variants serially via subprocess isolation
+- Parse multiple `EVAL_RESULT:` lines from the SSH run output
 - Save individual results to `iteration_{N}/variants/{variant_name}/eval_result.json`
+- scp IR/trace artifacts back into each variant dir
 
 ### Phase 3: ANALYZE
 
@@ -288,9 +289,9 @@ When the loop terminates:
    - Total rounds and variants evaluated
    - Final lineage table with all active and pruned lineages
 
-## TPU v7x Pallas Optimization Knowledge
+## TPU v6e Pallas Optimization Knowledge
 
-When writing kernel mutations, follow these TPU v7x Ironwood constraints:
+When writing kernel mutations, follow these TPU v6e (Trillium) constraints:
 
 **Hard rules (violating these causes compilation errors):**
 - Always use `jnp.bfloat16`, never `jnp.float16` — Mosaic compiler requires it

@@ -26,6 +26,10 @@ class CorrectnessConfig(BaseModel):
 
 
 class EvaluatorConfig(BaseModel):
+  # "kube" (GKE K8s Job) or "ssh" (run evaluate.py on a TPU-VM over SSH).
+  type: str = "kube"
+
+  # --- kube transport ---
   namespace: str = "default"
   job_template: str = ".github/ci/kernel-eval-job.yaml"
   repo: str = ""
@@ -33,10 +37,28 @@ class EvaluatorConfig(BaseModel):
   poll_interval: int = 15
   timeout: int = 600
 
+  # --- ssh transport (type: ssh) ---
+  ssh_host: str = ""
+  ssh_user: str = "cloud-user"
+  ssh_key: str = ""
+  ssh_remote_repo: str = "/home/cloud-user/Glaucis"
+  ssh_python: str = "/home/cloud-user/tpu-venv/bin/python"
+  ssh_remote_tmp: str = "/tmp/kernel_eval"
+  ssh_artifacts_dir: str = "/tmp/kernel_eval_artifacts"
+  ssh_extra_libtpu_init_args: str = ""
+
+
+class RooflineConfig(BaseModel):
+  """Per-chip peak numbers for roofline metrics. Defaults are TPU v6e (Trillium)."""
+  peak_flops: float = 918e12        # bf16 TFLOP/s
+  peak_hbm_bw: float = 1759e9       # HBM GB/s
+  hbm_capacity_gb: float = 32.0     # HBM per chip
+  vmem_capacity_mib: float = 128.0  # physical VMEM per chip
+
 
 class TPUConfig(BaseModel):
-  cluster: str
-  zone: str
+  cluster: str = ""
+  zone: str = ""
 
 
 class SessionConfig(BaseModel):
@@ -57,7 +79,8 @@ class EvolveConfig(BaseModel):
   shapes: list[dict[str, Any]]
   correctness: CorrectnessConfig = Field(default_factory=CorrectnessConfig)
   evaluator: EvaluatorConfig = Field(default_factory=EvaluatorConfig)
-  tpu: TPUConfig
+  roofline: RooflineConfig = Field(default_factory=RooflineConfig)
+  tpu: TPUConfig = Field(default_factory=TPUConfig)
   session: SessionConfig = Field(default_factory=SessionConfig)
   batch: BatchConfig = Field(default_factory=BatchConfig)
 

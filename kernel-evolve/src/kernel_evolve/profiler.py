@@ -437,8 +437,8 @@ def compute_derived_metrics(
   flops: float | None,
   hbm_bytes: int | None,
   latency_ms: float,
-  peak_flops_per_sec: float = 2307e12,
-  peak_hbm_bw_bytes_per_sec: float = 3690e9,
+  peak_flops_per_sec: float = 918e12,
+  peak_hbm_bw_bytes_per_sec: float = 1759e9,
 ) -> dict:
   """Compute arithmetic intensity, compute efficiency, and HBM bandwidth utilization.
 

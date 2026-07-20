@@ -122,11 +122,11 @@ Write the profile brief to `{ARTIFACTS_DIR}/profile_brief.md` using this templat
 | VLIW bundle count | {count} | {comparison to baseline if Round 2+} |
 | MXU dual ratio | {dual_ratio} | {poor(<0.5)/fair(0.5-0.8)/good(>0.8)} |
 | Avg ops/bundle (ILP) | {avg} | {poor(<2)/fair(2-3)/good(>3)} |
-| HBM bandwidth | {bytes} | {utilization_pct}% of 3690 GB/s peak |
+| HBM bandwidth | {bytes} | {utilization_pct}% of 1759 GB/s peak (v6e) |
 | Arithmetic intensity | {AI} FLOPs/byte | {low(<10)/medium(10-50)/high(>50)} |
-| Compute efficiency | {pct}% | of 2307 TFLOPS peak |
-| VMEM utilization | {vmem_pct}% of 64 MiB | {low(<30)/medium(30-70)/good(70-90)/critical(>90)} |
-| HBM capacity used | {hbm_cap_pct}% of 192 GB ({peak_memory_mb} MB) | {low/medium/high(>50)} |
+| Compute efficiency | {pct}% | of 918 TFLOPS peak (v6e) |
+| VMEM utilization | {vmem_pct}% of 128 MiB (v6e) | {low(<30)/medium(30-70)/good(70-90)/critical(>90)} |
+| HBM capacity used | {hbm_cap_pct}% of 32 GB (v6e) ({peak_memory_mb} MB) | {low/medium/high(>50)} |
 | DMA transfers | {count} | {double_buffered: yes/no} |
 | Pipeline NOPs | {nop_count} | {low(<10)/medium(10-50)/high(>50)} |
 
@@ -190,9 +190,9 @@ These signals are available in `eval_result.json` under `metadata.profile`:
 - `mxu_utilization.dual_ratio`: How evenly both MXUs (matrix units) are used. 1.0 = both equally loaded. <0.5 means one MXU is idle — check matmul dimensions.
 - `hbm_bandwidth_bytes`: Total HBM memory traffic per invocation. Lower = better. Pallas should keep data in VMEM to avoid HBM round-trips.
 - `arithmetic_intensity` (FLOPs/byte): Higher means more compute per byte of memory traffic. Low values indicate memory-bound behavior.
-- `compute_efficiency_pct`: Actual throughput vs TPU v7x peak (275 TFLOPS BF16). Shows headroom for optimization.
-- `vmem_utilization_pct`: On-chip VMEM usage as % of 64 MiB capacity. Higher is better (more on-chip reuse). <30% = underutilized, >90% = near OOM.
-- `hbm_capacity_utilization_pct`: Peak HBM memory usage as % of 192 GB capacity. High values mean large buffer allocations — check for redundant intermediates.
+- `compute_efficiency_pct`: Actual throughput vs TPU v6e peak (~918 TFLOPS bf16). Shows headroom for optimization.
+- `vmem_utilization_pct`: On-chip VMEM usage as % of 128 MiB capacity (v6e). Higher is better (more on-chip reuse). <30% = underutilized, >90% = near OOM.
+- `hbm_capacity_utilization_pct`: Peak HBM memory usage as % of 32 GB capacity (v6e). High values mean large buffer allocations — check for redundant intermediates.
 
 **When analyzing iteration results, check all signals — not just speedup and compute_ratio. VLIW bundle count and MXU dual_ratio are leading indicators of kernel quality.**
 

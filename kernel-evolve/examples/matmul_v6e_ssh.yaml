@@ -1,0 +1,47 @@
+# Example: optimize tiled_matmul on a TPU v6e-16 TPU-VM over SSH (no GKE).
+# Evaluation runs docker/evaluate.py on the VM; artifacts (LLO/HLO/trace) are
+# scp'd back. Fill in ssh_host / ssh_key for your current v6e worker.
+
+kernel:
+  name: "tiled_matmul"
+  template: "kernels/matmul.py"
+  reference: "kernels/matmul_ref.py"
+  evolve_markers:
+    start: "# EVOLVE-BLOCK-START"
+    end: "# EVOLVE-BLOCK-END"
+
+shapes:
+  - { M: 1024, N: 1024, K: 1024 }
+  - { M: 2048, N: 2048, K: 2048 }
+
+correctness:
+  method: "allclose"
+  rtol: 1e-2
+  atol: 1.0
+
+evaluator:
+  type: "ssh"
+  ssh_host: "REPLACE_WITH_WORKER_IP"        # current v6e worker (IPs go stale)
+  ssh_user: "cloud-user"
+  ssh_key: "/home/shuyang/.ssh/neurospark_cloud-user.sshkey"
+  ssh_remote_repo: "/home/cloud-user/Glaucis"     # checkout on the VM (pip install -e kernel-evolve/)
+  ssh_python: "/home/cloud-user/tpu-venv/bin/python"
+  ssh_remote_tmp: "/tmp/kernel_eval"
+  ssh_artifacts_dir: "/tmp/kernel_eval_artifacts"
+  timeout: 1800
+
+# Roofline peaks used for compute/HBM/VMEM utilization %. Defaults are v6e.
+roofline:
+  peak_flops: 918.0e12       # v6e bf16 TFLOP/s
+  peak_hbm_bw: 1759.0e9      # v6e HBM GB/s
+  hbm_capacity_gb: 32.0      # v6e HBM per chip
+  vmem_capacity_mib: 128.0   # v6e physical VMEM per chip (confirm; override if wrong)
+
+session:
+  max_iterations: 20
+  output_dir: "runs/matmul_v6e"
+
+batch:
+  variants_per_round: 5
+  top_k: 2
+  max_active_lineages: 4

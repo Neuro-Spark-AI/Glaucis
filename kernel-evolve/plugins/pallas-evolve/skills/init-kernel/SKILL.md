@@ -596,16 +596,19 @@ correctness:
   atol: 1.0
 
 evaluator:
-  namespace: "default"
-  job_template: ".github/ci/kernel-eval-job.yaml"
-  repo: "sii-xinglong/Glaucis"
-  branch: "main"
-  poll_interval: 15
-  timeout: 600
+  type: "ssh"
+  ssh_host: "REPLACE_WITH_WORKER_IP"        # current v6e worker (IPs go stale)
+  ssh_user: "cloud-user"
+  ssh_key: "REPLACE_WITH_SSH_KEY_PATH"
+  ssh_remote_repo: "/home/cloud-user/Glaucis"
+  ssh_python: "/home/cloud-user/tpu-venv/bin/python"
+  timeout: 1800
 
-tpu:
-  cluster: "tpu7x-cluster"
-  zone: "us-central1"
+roofline:                     # TPU v6e (Trillium) peaks
+  peak_flops: 918.0e12
+  peak_hbm_bw: 1759.0e9
+  hbm_capacity_gb: 32.0
+  vmem_capacity_mib: 128.0
 
 batch:
   variants_per_round: 5
@@ -736,13 +739,13 @@ print('EVOLVE-BLOCK content OK')
 
 Verify the template kernel compiles and runs on TPU, collect baseline performance metrics and profiling artifacts.
 
-1. **Verify kubectl connectivity**:
+1. **Verify SSH connectivity to the TPU-VM**:
 
    ```bash
-   kubectl cluster-info
+   ssh -i {evaluator.ssh_key} {evaluator.ssh_user}@{evaluator.ssh_host} "{evaluator.ssh_python} -c 'import jax; print(jax.devices())'"
    ```
 
-   If not connected, **stop with error**: "TPU connectivity required for baseline profiling. Connect to the GKE cluster (`gcloud container clusters get-credentials tpu7x-cluster --zone us-central1`) and re-run."
+   Should list TPU devices. If unreachable, **stop with error**: "TPU connectivity required for baseline profiling. Check evaluator.ssh_host (worker IPs go stale — re-discover with gcloud) and evaluator.ssh_key, then re-run."
 
 2. **Create baseline directory**:
 
@@ -764,7 +767,7 @@ Verify the template kernel compiles and runs on TPU, collect baseline performanc
 4. **Submit baseline for TPU evaluation**: Invoke `pallas-evolve:submit` via the Skill tool, pointing at the temporary iteration directory. This will:
    - Submit the baseline kernel as a single-variant batch
    - Collect `eval_result.json` with performance metrics and deep profiling data
-   - Download `llo_final.txt`, `hlo_post_opt.txt`, `trace_events.json` from GCS
+   - scp `llo_final.txt`, `hlo_post_opt.txt`, `trace_events.json` back from the VM
 
 5. **Copy results to permanent baseline directory**:
 

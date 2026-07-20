@@ -96,11 +96,11 @@ For each variant, classify status and analyze performance:
   - `arithmetic_intensity`: FLOPs per byte of HBM traffic. Higher = more compute per byte.
   - `compute_efficiency_pct`: actual FLOPS / peak FLOPS as percentage.
   - `hbm_bandwidth_utilization_pct`: actual HBM bandwidth / peak bandwidth as percentage. >80% = near bandwidth ceiling.
-  - `hbm_capacity_utilization_pct`: peak HBM memory allocated as percentage of 192 GB capacity. High values indicate large buffer allocations in HBM.
+  - `hbm_capacity_utilization_pct`: peak HBM memory allocated as percentage of 32 GB capacity (v6e). High values indicate large buffer allocations in HBM.
   - `vmem_allocation.vmem_bytes`: total on-chip VMEM allocated. High values indicate VMEM pressure.
-  - `vmem_utilization_pct`: VMEM bytes allocated as percentage of 64 MiB physical capacity. Higher = better utilization of on-chip memory (up to ~90%). >90% = near OOM risk. <30% = underutilized, room to increase block sizes or add scratch memory.
+  - `vmem_utilization_pct`: VMEM bytes allocated as percentage of 128 MiB physical capacity (v6e). Higher = better utilization of on-chip memory (up to ~90%). >90% = near OOM risk. <30% = underutilized, room to increase block sizes or add scratch memory.
   - `bundle_density.avg_ops_per_bundle`: average operations per VLIW bundle. Higher = better ILP. <2.0 = poor slot utilization.
-  - `bundle_density.max_ops_per_bundle`: peak ILP achieved. TPU v7x can do up to 8 ops/bundle.
+  - `bundle_density.max_ops_per_bundle`: peak ILP achieved. TPU v6e packs multiple ops per bundle.
   - `dma_analysis.dma_count`: total DMA transfer operations. High count may indicate excessive data movement.
   - `dma_analysis.double_buffering`: whether the kernel uses double buffering (iteration % 2 buffer slots). False = DMA cannot overlap with compute.
   - `fusion_analysis.fusion_count`: number of XLA fused_computation blocks. More fusions = more HBM round-trips. Pallas kernels should have 0.
@@ -352,9 +352,9 @@ Write two output files:
 | compute_efficiency | {compute_efficiency_pct}% | {vs peak FLOPS} |
 | HBM bandwidth | {hbm_bandwidth_bytes} bytes | {comparison to optimal} |
 | HBM BW utilization | {hbm_bandwidth_utilization_pct}% | {near ceiling / headroom} |
-| HBM capacity used | {hbm_capacity_utilization_pct}% of 192 GB ({peak_memory_mb} MB) | {low/medium/high(>50)} |
+| HBM capacity used | {hbm_capacity_utilization_pct}% of 32 GB (v6e) ({peak_memory_mb} MB) | {low/medium/high(>50)} |
 | VMEM allocated | {vmem_allocation.vmem_bytes} bytes | {pressure level} |
-| VMEM utilization | {vmem_utilization_pct}% of 64 MiB | {low(<30)/medium(30-70)/good(70-90)/critical(>90)} |
+| VMEM utilization | {vmem_utilization_pct}% of 128 MiB (v6e) | {low(<30)/medium(30-70)/good(70-90)/critical(>90)} |
 | Bundle density (avg) | {avg_ops_per_bundle} ops/bundle | {poor/fair/good} |
 | DMA transfers | {dma_count} ({double_buffering ? "double-buffered" : "single-buffered"}) | {assessment} |
 | Pipeline NOPs | {nop_count} | {low/concerning/high} |

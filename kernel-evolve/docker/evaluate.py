@@ -863,10 +863,11 @@ def stage_profile_deep(exec_globals, shapes, dump_dir=None):
       flops / hbm_bytes if flops and hbm_bytes else None
     )
 
-    # VMEM utilization: vmem_bytes vs 64 MiB physical capacity (TPU v7x)
+    # VMEM utilization: vmem_bytes vs physical VMEM capacity.
+    # Default is TPU v6e (Trillium); override with VMEM_CAPACITY_MIB.
     vmem_utilization_pct = None
     if vmem_allocation is not None and vmem_allocation["vmem_bytes"] > 0:
-      vmem_capacity_bytes = 64 * 1024 * 1024  # 64 MiB per chip
+      vmem_capacity_bytes = int(float(os.environ.get("VMEM_CAPACITY_MIB", 128)) * 1024 * 1024)
       vmem_utilization_pct = vmem_allocation["vmem_bytes"] / vmem_capacity_bytes * 100.0
 
     return {
@@ -1010,22 +1011,22 @@ def main():
     )
 
   # Compute efficiency from deep profile FLOPs and measured latency
-  # TPU v7x per-chip peak: 2307 TFLOPS
-  peak_flops = float(os.environ.get("PEAK_FLOPS", 2307e12))
+  # TPU v6e (Trillium) per-chip peak: ~918 TFLOPS bf16. Override with PEAK_FLOPS.
+  peak_flops = float(os.environ.get("PEAK_FLOPS", 918e12))
   if deep_profile.get("flops") and bench_result["latency_ms"] > 0:
     actual_fps = deep_profile["flops"] / (bench_result["latency_ms"] / 1000.0)
     deep_profile["compute_efficiency_pct"] = (actual_fps / peak_flops) * 100.0
 
-  # HBM bandwidth utilization (TPU v7x peak: 3690 GB/s)
-  peak_hbm_bw = float(os.environ.get("PEAK_HBM_BW", 3690e9))
+  # HBM bandwidth utilization (TPU v6e peak: ~1759 GB/s). Override with PEAK_HBM_BW.
+  peak_hbm_bw = float(os.environ.get("PEAK_HBM_BW", 1759e9))
   if deep_profile.get("hbm_bandwidth_bytes") and bench_result["latency_ms"] > 0:
     actual_bw = deep_profile["hbm_bandwidth_bytes"] / (bench_result["latency_ms"] / 1000.0)
     deep_profile["hbm_bandwidth_utilization_pct"] = (actual_bw / peak_hbm_bw) * 100.0
 
-  # HBM capacity utilization (TPU v7x: 192 GB per chip)
+  # HBM capacity utilization (TPU v6e: 32 GB per chip). Override with HBM_CAPACITY_GB.
   peak_memory_mb = bench_result.get("benchmark", {}).get("peak_memory_mb")
   if peak_memory_mb is not None and peak_memory_mb > 0:
-    hbm_capacity_mb = 192 * 1024  # 192 GB in MB
+    hbm_capacity_mb = float(os.environ.get("HBM_CAPACITY_GB", 32)) * 1024  # GB -> MB
     deep_profile["hbm_capacity_utilization_pct"] = peak_memory_mb / hbm_capacity_mb * 100.0
 
   # ── Upload profile artifacts to GCS (non-fatal) ──
@@ -1041,6 +1042,27 @@ def main():
       artifacts["hlo_post_opt.txt"] = hlo_path
     if llo_path:
       artifacts["llo_final.txt"] = llo_path
+
+  # ── Copy artifacts to a local dir for non-GCS transports (e.g. SSH). ──
+  # When ARTIFACTS_LOCAL_DIR is set, each artifact is copied to
+  # {ARTIFACTS_LOCAL_DIR}/{variant_id}/ so an SSH-based evaluator can scp
+  # them back without any GCS bucket.
+  artifacts_local_dir_env = os.environ.get("ARTIFACTS_LOCAL_DIR")
+  copied_local = []
+  local_variant_dir = ""
+  if artifacts_local_dir_env and artifacts:
+    import shutil
+    local_variant_dir = os.path.join(artifacts_local_dir_env, job_name)
+    os.makedirs(local_variant_dir, exist_ok=True)
+    for name, local_path in artifacts.items():
+      try:
+        if local_path and os.path.exists(local_path):
+          shutil.copy(local_path, os.path.join(local_variant_dir, name))
+          copied_local.append(name)
+      except Exception as e:
+        print(f"Local artifact copy failed for {name}: {e}", file=sys.stderr)
+    if copied_local:
+      print(f"Copied artifacts {copied_local} to {local_variant_dir}", file=sys.stderr)
 
   gcs_result = upload_to_gcs(job_name, artifacts) if artifacts else {"ok": False, "uploaded": [], "gcs_prefix": ""}
   if gcs_result["ok"]:
@@ -1067,6 +1089,7 @@ def main():
       "benchmark": bench_result.get("benchmark"),
       "reference_benchmark": ref_bench.get("benchmark"),
       **({"artifacts_gcs_prefix": gcs_result["gcs_prefix"]} if gcs_result.get("ok") else {}),
+      **({"artifacts_local_dir": local_variant_dir} if copied_local else {}),
     },
   }
   print(f"EVAL_RESULT:{json.dumps(result)}")

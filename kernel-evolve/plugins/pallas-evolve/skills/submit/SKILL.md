@@ -1,17 +1,47 @@
 ---
 name: submit
-description: Use when submitting a batch of Pallas kernel variants for TPU evaluation via kubectl — creates single K8s Job that evaluates N variants serially, collects all EVAL_RESULTs
+description: Use when submitting a batch of Pallas kernel variants for TPU evaluation over SSH — runs evaluate.py on a TPU-VM (e.g. v6e-16), collects all EVAL_RESULTs, scp's artifacts back
 ---
 
-# Submit Batch of Kernel Variants for TPU Evaluation
+# Submit Batch of Kernel Variants for TPU Evaluation (SSH)
 
-Submit a batch of kernel variants for evaluation on GKE TPU v7x via a single K8s Job. Builds a combined payload with all variants, creates a ConfigMap, deploys the Job, and collects per-variant results.
+Submit a batch of kernel variants for evaluation on a TPU-VM over SSH. Builds a
+combined payload with all variants, stages it on the VM, runs
+`kernel-evolve/docker/evaluate.py` there (which evaluates variants serially in
+subprocess isolation), collects per-variant results, and scp's IR/trace
+artifacts back. No GKE / kubectl / GCS.
 
 ## Context
 
-This skill is invoked by `pallas-evolve:start` during the optimization loop, or standalone for debugging. It expects:
+Invoked by `pallas-evolve:start` during the optimization loop, or standalone for
+debugging. It expects:
 - A run directory with the current iteration's `variants/` subdirectory containing one or more variant kernels
-- A config YAML already loaded in context (kernel paths, shapes, evaluator settings)
+- A config YAML already loaded in context with an `evaluator.type: ssh` block and a `roofline` block
+
+Required config fields (under `evaluator`): `ssh_host`, `ssh_user`, `ssh_key`,
+`ssh_remote_repo`, `ssh_python`, `ssh_remote_tmp`, `ssh_artifacts_dir`.
+The VM must have the repo checked out at `ssh_remote_repo` with kernel-evolve
+installed into `ssh_python`'s env (`uv pip install -e kernel-evolve/`), and a
+working TPU runtime.
+
+Define these shell vars from the config before starting:
+
+```bash
+SSH_HOST="{evaluator.ssh_host}"
+SSH_USER="{evaluator.ssh_user}"
+SSH_KEY="{evaluator.ssh_key}"
+REMOTE_REPO="{evaluator.ssh_remote_repo}"
+REMOTE_PY="{evaluator.ssh_python}"
+REMOTE_TMP="{evaluator.ssh_remote_tmp}"
+REMOTE_ART="{evaluator.ssh_artifacts_dir}"
+PEAK_FLOPS="{roofline.peak_flops}"               # v6e default 918e12
+PEAK_HBM_BW="{roofline.peak_hbm_bw}"             # v6e default 1759e9
+HBM_CAPACITY_GB="{roofline.hbm_capacity_gb}"     # v6e default 32
+VMEM_CAPACITY_MIB="{roofline.vmem_capacity_mib}" # v6e default 128
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30"
+SSH="ssh -i ${SSH_KEY} ${SSH_OPTS} ${SSH_USER}@${SSH_HOST}"
+SCP="scp -r -i ${SSH_KEY} ${SSH_OPTS}"
+```
 
 ## Procedure
 
@@ -59,220 +89,142 @@ print(base64.b64encode(payload.encode()).decode())
   '<shapes_json_array>' \
   "{rtol}" \
   "{atol}" \
-  "<path/to/iteration_N/variants>"
+  "<path/to/iteration_N/variants>" > /tmp/batch_payload.b64
 ```
 
-Save the output as `B64_PAYLOAD`.
+The base64 payload is now in `/tmp/batch_payload.b64`. (Writing to a file avoids
+huge argv/env strings; there is no ConfigMap 900KB limit on the SSH path.)
 
-### Step 3: Payload size check
-
-Check the size of the base64-encoded payload:
-
-```bash
-echo -n "${B64_PAYLOAD}" | wc -c
-```
-
-If the payload exceeds 900KB (921600 bytes):
-1. Decode back to raw JSON and save to a temp file
-2. Upload to GCS:
-   ```bash
-   echo "${B64_PAYLOAD}" | base64 -d > /tmp/payload.json
-   gcloud storage cp /tmp/payload.json "gs://glaucis-profiles/${JOB_NAME}/payload.json"
-   rm /tmp/payload.json
-   ```
-3. Replace `B64_PAYLOAD` with the base64 encoding of a pointer JSON:
-   ```bash
-   B64_PAYLOAD=$(echo -n '{"gcs_payload":"gs://glaucis-profiles/'${JOB_NAME}'/payload.json"}' | base64)
-   ```
-
-> **Note:** The pod-side evaluator must detect `gcs_payload` and download the full payload. If this is not yet implemented, warn the user that payloads above 900KB may not work and consider reducing variant count.
-
-### Step 4: Generate job name
-
-Include the kernel name from the config and a timestamp to prevent conflicts between concurrent optimizations:
+### Step 3: Generate job name
 
 ```bash
 KERNEL_NAME_SLUG=$(echo "{kernel_name}" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
 TIMESTAMP=$(date +%m%d-%H%M%S)
-JOB_NAME="${KERNEL_NAME_SLUG}-iter${N}-${TIMESTAMP}"
+JOB_NAME=$(echo "${KERNEL_NAME_SLUG}-iter${N}-${TIMESTAMP}" | cut -c1-63 | sed 's/-$//')
+REMOTE_PAYLOAD="${REMOTE_TMP}/${JOB_NAME}.payload"
+REMOTE_ART_RUN="${REMOTE_ART}/${JOB_NAME}"
 ```
 
-Job names must be: lowercase, alphanumeric + hyphens, max 63 chars. Truncate if needed:
+### Step 4: Stage payload on the VM
 
 ```bash
-JOB_NAME=$(echo "${JOB_NAME}" | cut -c1-63 | sed 's/-$//')
+$SSH "mkdir -p ${REMOTE_TMP} ${REMOTE_ART_RUN}" && \
+cat /tmp/batch_payload.b64 | $SSH "cat > ${REMOTE_PAYLOAD}" && \
+echo "staged payload -> ${SSH_USER}@${SSH_HOST}:${REMOTE_PAYLOAD}"
 ```
 
-Example: optimizing `chunk_gla` at iteration 3 → `chunk-gla-iter3-0330-142517`.
+If staging fails, save synthetic error results for ALL variants and stop.
 
-### Step 5: Create ConfigMap
+### Step 5: Run evaluate.py on the VM
+
+`evaluate.py` sets its own IR-dump flags (region trace + LLO debug info) and
+preserves existing env. Pass the v6e roofline peaks and `ARTIFACTS_LOCAL_DIR` so
+each variant writes LLO/HLO/trace under `${REMOTE_ART_RUN}/<variant_id>/`.
 
 ```bash
-kubectl create configmap ${JOB_NAME}-payload \
-  --from-literal=payload="${B64_PAYLOAD}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl label configmap ${JOB_NAME}-payload app=kernel-eval --overwrite
+TIMEOUT=$((300 * N_VARIANTS + 300))
+$SSH "cd ${REMOTE_REPO}/kernel-evolve && \
+  JAX_PLATFORMS=tpu,cpu ENABLE_PJRT_COMPATIBILITY=true \
+  PEAK_FLOPS=${PEAK_FLOPS} PEAK_HBM_BW=${PEAK_HBM_BW} \
+  HBM_CAPACITY_GB=${HBM_CAPACITY_GB} VMEM_CAPACITY_MIB=${VMEM_CAPACITY_MIB} \
+  ARTIFACTS_LOCAL_DIR=${REMOTE_ART_RUN} \
+  ${REMOTE_PY} docker/evaluate.py --eval-payload-file ${REMOTE_PAYLOAD}" \
+  > /tmp/${JOB_NAME}.log 2>&1
+echo "exit=$?"
 ```
 
-### Step 6: Deploy K8s Job
+Use a Bash tool call with `timeout: {TIMEOUT * 1000 + 30000}` (ms, plus buffer).
+Even on non-zero exit, proceed to Step 6 — some variants may have printed
+`EVAL_RESULT:` before a later one failed.
 
-Read the job template path from the config's `evaluator.job_template` (relative to repo root). Render with variable substitution and apply:
+### Step 6: Collect and parse results
 
-```bash
-ACTIVE_DEADLINE=1800
-
-python3 -c "
-import string, sys
-tmpl = open(sys.argv[1]).read()
-rendered = string.Template(tmpl).safe_substitute(
-    JOB_NAME=sys.argv[2],
-    BRANCH=sys.argv[3],
-    REPO=sys.argv[4],
-    VARIANT_ID=sys.argv[5],
-    ACTIVE_DEADLINE=sys.argv[6]
-)
-print(rendered)
-" \
-  "{job_template_path}" \
-  "${JOB_NAME}" \
-  "{branch}" \
-  "{repo}" \
-  "batch-${N_VARIANTS}" \
-  "${ACTIVE_DEADLINE}" | kubectl apply -f -
-```
-
-### Step 7: Wait for completion
-
-Calculate the timeout based on variant count:
-
-```bash
-TIMEOUT=1800
-kubectl wait --for=condition=complete --timeout=${TIMEOUT}s job/${JOB_NAME} 2>/dev/null && echo "JOB_STATUS:Complete" || \
-kubectl wait --for=condition=failed --timeout=5s job/${JOB_NAME} 2>/dev/null && echo "JOB_STATUS:Failed" || \
-echo "JOB_STATUS:Timeout"
-```
-
-Use a Bash tool call with `timeout: {TIMEOUT * 1000 + 30000}` (timeout in ms, plus buffer).
-
-On timeout or failure, check the job status for diagnostics:
-```bash
-kubectl get job/${JOB_NAME} -o jsonpath='{.status.conditions}'
-```
-
-Even on failure/timeout, proceed to Step 8 to collect any partial results.
-
-### Step 8: Collect and parse results
-
-Fetch logs from the job:
-
-```bash
-kubectl logs job/${JOB_NAME} -c kernel-eval
-```
-
-Scan the logs for ALL lines containing `EVAL_RESULT:`. Each line is one variant's result JSON. Parse each result and match `variant_id` to the directory name under `iteration_{N}/variants/`.
-
-Use a Python script to parse and distribute results:
+Scan `/tmp/${JOB_NAME}.log` for ALL lines containing `EVAL_RESULT:`. Each line is
+one variant's result JSON. Distribute to per-variant `eval_result.json`:
 
 ```bash
 python3 -c "
 import json, sys, os
 
-logs = sys.stdin.read()
-variants_dir = sys.argv[1]
+logs = open(sys.argv[1]).read()
+variants_dir = sys.argv[2]
 
-# Collect all EVAL_RESULT lines
 results = {}
 for line in logs.splitlines():
     if 'EVAL_RESULT:' in line:
-        json_str = line.split('EVAL_RESULT:', 1)[1].strip()
         try:
-            result = json.loads(json_str)
-            vid = result.get('variant_id', '')
-            results[vid] = result
+            r = json.loads(line.split('EVAL_RESULT:', 1)[1].strip())
+            results[r.get('variant_id', '')] = r
         except json.JSONDecodeError:
             pass
 
-# Get all variant directories
-variant_dirs = [d for d in os.listdir(variants_dir)
-                if os.path.isdir(os.path.join(variants_dir, d))]
-
-for vdir in variant_dirs:
-    out_path = os.path.join(variants_dir, vdir, 'eval_result.json')
+for vdir in [d for d in os.listdir(variants_dir) if os.path.isdir(os.path.join(variants_dir, d))]:
+    out = os.path.join(variants_dir, vdir, 'eval_result.json')
     if vdir in results:
-        with open(out_path, 'w') as f:
-            json.dump(results[vdir], f, indent=2)
-        print(f'Saved result for {vdir}: status={results[vdir].get(\"status\", \"UNKNOWN\")}')
+        json.dump(results[vdir], open(out, 'w'), indent=2)
+        print(f'Saved {vdir}: status={results[vdir].get(\"status\")}')
     else:
-        # Synthetic error for missing results
-        synthetic = {
-            'variant_id': vdir,
-            'status': 'COMPILE_ERROR',
-            'fitness': 0.0,
-            'error': f'No EVAL_RESULT found for variant {vdir} in job logs',
-            'latency_ms': 0.0,
-            'speedup': 0.0
-        }
-        with open(out_path, 'w') as f:
-            json.dump(synthetic, f, indent=2)
-        print(f'Saved synthetic error for {vdir}: no result in logs')
-" "<path/to/iteration_N/variants>" <<< "$(kubectl logs job/${JOB_NAME} -c kernel-eval)"
+        json.dump({'variant_id': vdir, 'status': 'COMPILE_ERROR', 'fitness': 0.0,
+                   'error': 'No EVAL_RESULT in remote logs', 'latency_ms': 0.0, 'speedup': 0.0},
+                  open(out, 'w'), indent=2)
+        print(f'Saved synthetic error for {vdir}')
+" "/tmp/${JOB_NAME}.log" "<path/to/iteration_N/variants>"
 ```
 
-### Step 8b: Download artifacts
+### Step 7: Pull artifacts back (scp)
 
-For each variant that has a result with `metadata.artifacts_gcs_prefix`, download IR and trace files:
+For each variant whose `eval_result.json` has `metadata.artifacts_local_dir`,
+scp the contents of that remote dir into the local variant dir:
 
 ```bash
 for VARIANT_DIR in iteration_N/variants/*/; do
   VARIANT_NAME=$(basename "$VARIANT_DIR")
   RESULT_FILE="${VARIANT_DIR}eval_result.json"
-
-  if [ -f "$RESULT_FILE" ]; then
-    GCS_PREFIX=$(python3 -c "
-import json, sys
-r = json.load(open(sys.argv[1]))
-print(r.get('metadata', {}).get('artifacts_gcs_prefix', ''))
-" "$RESULT_FILE")
-
-    if [ -n "$GCS_PREFIX" ]; then
-      gcloud storage cp -r "${GCS_PREFIX}/*" "${VARIANT_DIR}" 2>/dev/null && \
-        echo "Downloaded artifacts for ${VARIANT_NAME} from ${GCS_PREFIX}" || \
-        echo "Artifact download skipped for ${VARIANT_NAME} (GCS not configured or empty)"
-    fi
+  [ -f "$RESULT_FILE" ] || continue
+  REMOTE_ART_DIR=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('metadata') or {}).get('artifacts_local_dir',''))" "$RESULT_FILE")
+  if [ -n "$REMOTE_ART_DIR" ]; then
+    $SCP "${SSH_USER}@${SSH_HOST}:${REMOTE_ART_DIR}/." "${VARIANT_DIR}" 2>/dev/null && \
+      echo "pulled artifacts for ${VARIANT_NAME}" || \
+      echo "artifact pull skipped for ${VARIANT_NAME}"
   fi
 done
 ```
 
 This downloads up to three files per variant:
-- `hlo_post_opt.txt` — Post-optimization HLO IR text
-- `llo_final.txt` — Final-pass LLO IR text with VLIW bundles
-- `trace_events.json` — Expanded XPlane trace events (Chrome trace format)
+- `hlo_post_opt.txt` — post-optimization HLO IR text
+- `llo_final.txt` — final-pass LLO IR text with VLIW bundles
+- `trace_events.json` — expanded XPlane trace events (Chrome trace format)
 
-These files are optional. If download fails, the analyze skill falls back to metrics-only analysis.
+These files are optional. If pull fails, the analyze skill falls back to metrics-only analysis.
 
-### Step 9: Cleanup
+### Step 8: Cleanup
 
-Always clean up, even on failure:
+Always clean up remote temp files and the local log:
 
 ```bash
-kubectl delete job ${JOB_NAME} --ignore-not-found
-kubectl delete configmap ${JOB_NAME}-payload --ignore-not-found
+$SSH "rm -rf ${REMOTE_PAYLOAD} ${REMOTE_ART_RUN}"
+rm -f /tmp/${JOB_NAME}.log /tmp/batch_payload.b64
 ```
 
 ## Error Handling
 
-- If ConfigMap creation fails: save synthetic error results for ALL variants, skip to cleanup
-- If Job apply fails: save synthetic error results for ALL variants, clean up ConfigMap
-- If Job times out or fails: still collect partial results from logs (some variants may have succeeded), then clean up
-- If log collection fails: save synthetic error results for all variants with "Failed to collect logs"
-- If a variant has no matching `EVAL_RESULT:` in the logs: save a synthetic COMPILE_ERROR for that variant
-- Partial results are acceptable — some variants may succeed while others fail
-- Always run cleanup step (Step 9) regardless of outcome
+- If payload staging (Step 4) fails: save synthetic error results for ALL variants, skip run, clean up.
+- If the SSH run (Step 5) times out or errors: still parse partial results from the log (some variants may have succeeded), then clean up.
+- If a variant has no matching `EVAL_RESULT:` in the log: save a synthetic COMPILE_ERROR for that variant.
+- Partial results are acceptable — some variants may succeed while others fail.
+- Always run the cleanup step regardless of outcome.
+- SSH host key / auth failures: verify `ssh_key` path and that the current `ssh_host` is the live worker IP (IPs go stale; re-discover with gcloud if needed).
 
-### Step 10: Context note
+### Step 9: Context note
 
-All evaluation results have been distributed to per-variant `eval_result.json` files, artifacts downloaded, and K8s resources cleaned up.
+All evaluation results have been distributed to per-variant `eval_result.json`
+files, artifacts pulled, and remote temp files cleaned up.
 
-**Do NOT compact here** — this skill is typically invoked within the `pallas-evolve:start` loop (Phase 2), and the subsequent Phase 3 (ANALYZE) needs orchestration context (iteration number, run directory) to locate results. The start loop manages compaction at Phase 5.
+**Do NOT compact here** — this skill is typically invoked within the
+`pallas-evolve:start` loop (Phase 2), and the subsequent Phase 3 (ANALYZE) needs
+orchestration context (iteration number, run directory) to locate results. The
+start loop manages compaction at Phase 5.
 
-If invoked **standalone** (outside the start loop), invoke `/compact` after this skill completes — the K8s Job logs, base64 payload, and polling output are no longer needed in context.
+If invoked **standalone** (outside the start loop), invoke `/compact` after this
+skill completes — the SSH logs, base64 payload, and run output are no longer
+needed in context.
