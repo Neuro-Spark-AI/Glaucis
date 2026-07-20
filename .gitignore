@@ -4,3 +4,10 @@
 
 __pycache__/
 *.pyc
+*.egg-info/
+
+# This repo is private + self-contained; kernels/configs are tracked here.
+# Only ignore heavy/transient run byproducts:
+/kernel-evolve/artifacts/
+/kernel-evolve/examples/pulled_*/
+**/eval_result.tmp

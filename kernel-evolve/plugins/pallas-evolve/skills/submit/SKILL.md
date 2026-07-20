@@ -18,16 +18,28 @@ debugging. It expects:
 - A run directory with the current iteration's `variants/` subdirectory containing one or more variant kernels
 - A config YAML already loaded in context with an `evaluator.type: ssh` block and a `roofline` block
 
-Required config fields (under `evaluator`): `ssh_host`, `ssh_user`, `ssh_key`,
-`ssh_remote_repo`, `ssh_python`, `ssh_remote_tmp`, `ssh_artifacts_dir`.
-The VM must have the repo checked out at `ssh_remote_repo` with kernel-evolve
-installed into `ssh_python`'s env (`uv pip install -e kernel-evolve/`), and a
-working TPU runtime.
+Required config fields (under `evaluator`): `ssh_host` **or** `ssh_hosts`,
+`ssh_user`, `ssh_key`, `ssh_remote_repo`, `ssh_python`, `ssh_remote_tmp`,
+`ssh_artifacts_dir`. The VM(s) must have the repo checked out at
+`ssh_remote_repo` with kernel-evolve installed into `ssh_python`'s env
+(`uv pip install -e kernel-evolve/`), and a working TPU runtime.
+
+**Multi-host ICI slices (e.g. v6e-16 = 4 hosts).** A multi-host slice shares one
+ICI domain; libtpu does a slice-wide init barrier, so `evaluate.py` MUST be
+co-launched on EVERY host at once. A single-host invocation hangs forever
+waiting for its peers — this is the most common failure on v6e-16. The kernel
+template is single-device, so each host independently runs the same kernel on
+its local chip and prints an identical `EVAL_RESULT:`; collect results and
+artifacts from the FIRST host (the "primary") only. The other hosts run the same
+program solely to satisfy the barrier.
 
 Define these shell vars from the config before starting:
 
 ```bash
-SSH_HOST="{evaluator.ssh_host}"
+# Host list: prefer evaluator.ssh_hosts (all worker IPs of the slice); if the
+# config only has evaluator.ssh_host, use that single host. First = primary.
+SSH_HOSTS=( {space-separated evaluator.ssh_hosts, or just evaluator.ssh_host} )
+PRIMARY="${SSH_HOSTS[0]}"
 SSH_USER="{evaluator.ssh_user}"
 SSH_KEY="{evaluator.ssh_key}"
 REMOTE_REPO="{evaluator.ssh_remote_repo}"
@@ -37,10 +49,11 @@ REMOTE_ART="{evaluator.ssh_artifacts_dir}"
 PEAK_FLOPS="{roofline.peak_flops}"               # v6e default 918e12
 PEAK_HBM_BW="{roofline.peak_hbm_bw}"             # v6e default 1759e9
 HBM_CAPACITY_GB="{roofline.hbm_capacity_gb}"     # v6e default 32
-VMEM_CAPACITY_MIB="{roofline.vmem_capacity_mib}" # v6e default 128
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30"
-SSH="ssh -i ${SSH_KEY} ${SSH_OPTS} ${SSH_USER}@${SSH_HOST}"
-SCP="scp -r -i ${SSH_KEY} ${SSH_OPTS}"
+VMEM_CAPACITY_MIB="{roofline.vmem_capacity_mib}" # v6e default 128 (physical)
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30 -o ConnectTimeout=15"
+# Per-host ssh/scp helpers (pass the host as $1):
+ssh_h() { ssh -i "${SSH_KEY}" ${SSH_OPTS} "${SSH_USER}@$1" "${@:2}"; }
+scp_from() { scp -r -i "${SSH_KEY}" ${SSH_OPTS} "${SSH_USER}@$1:$2" "$3"; }
 ```
 
 ## Procedure
@@ -105,37 +118,60 @@ REMOTE_PAYLOAD="${REMOTE_TMP}/${JOB_NAME}.payload"
 REMOTE_ART_RUN="${REMOTE_ART}/${JOB_NAME}"
 ```
 
-### Step 4: Stage payload on the VM
+### Step 4: Stage payload on every host
+
+Each host needs its own copy of the payload — there is no shared filesystem
+across an ICI slice.
 
 ```bash
-$SSH "mkdir -p ${REMOTE_TMP} ${REMOTE_ART_RUN}" && \
-cat /tmp/batch_payload.b64 | $SSH "cat > ${REMOTE_PAYLOAD}" && \
-echo "staged payload -> ${SSH_USER}@${SSH_HOST}:${REMOTE_PAYLOAD}"
+for H in "${SSH_HOSTS[@]}"; do
+  ssh_h "$H" "mkdir -p ${REMOTE_TMP} ${REMOTE_ART_RUN}" && \
+  ssh_h "$H" "cat > ${REMOTE_PAYLOAD}" < /tmp/batch_payload.b64 && \
+  echo "staged payload -> ${SSH_USER}@${H}:${REMOTE_PAYLOAD}"
+done
 ```
 
-If staging fails, save synthetic error results for ALL variants and stop.
+If staging fails on the PRIMARY, save synthetic error results for ALL variants
+and stop. (A failure on a non-primary host also aborts the run — the barrier
+cannot form — so treat any staging failure as fatal.)
 
-### Step 5: Run evaluate.py on the VM
+### Step 5: Co-launch evaluate.py on ALL hosts
 
 `evaluate.py` sets its own IR-dump flags (region trace + LLO debug info) and
 preserves existing env. Pass the v6e roofline peaks and `ARTIFACTS_LOCAL_DIR` so
 each variant writes LLO/HLO/trace under `${REMOTE_ART_RUN}/<variant_id>/`.
 
+Launch on every host **simultaneously** (background jobs), then wait for all.
+The hosts share one ICI domain: they must init libtpu together or every one of
+them blocks on the barrier. Parse only the PRIMARY's log in Step 6.
+
 ```bash
 TIMEOUT=$((300 * N_VARIANTS + 300))
-$SSH "cd ${REMOTE_REPO}/kernel-evolve && \
-  JAX_PLATFORMS=tpu,cpu ENABLE_PJRT_COMPATIBILITY=true \
+EVAL_ENV="JAX_PLATFORMS=tpu,cpu ENABLE_PJRT_COMPATIBILITY=true \
   PEAK_FLOPS=${PEAK_FLOPS} PEAK_HBM_BW=${PEAK_HBM_BW} \
   HBM_CAPACITY_GB=${HBM_CAPACITY_GB} VMEM_CAPACITY_MIB=${VMEM_CAPACITY_MIB} \
-  ARTIFACTS_LOCAL_DIR=${REMOTE_ART_RUN} \
-  ${REMOTE_PY} docker/evaluate.py --eval-payload-file ${REMOTE_PAYLOAD}" \
-  > /tmp/${JOB_NAME}.log 2>&1
-echo "exit=$?"
+  ARTIFACTS_LOCAL_DIR=${REMOTE_ART_RUN}"
+EVAL_CMD="cd ${REMOTE_REPO}/kernel-evolve && ${EVAL_ENV} ${REMOTE_PY} docker/evaluate.py --eval-payload-file ${REMOTE_PAYLOAD}"
+
+pids=()
+for i in "${!SSH_HOSTS[@]}"; do
+  H="${SSH_HOSTS[$i]}"
+  ssh_h "$H" "$EVAL_CMD" > "/tmp/${JOB_NAME}.w${i}.log" 2>&1 </dev/null &
+  pids+=($!)
+done
+for i in "${!pids[@]}"; do wait "${pids[$i]}"; echo "host${i} (${SSH_HOSTS[$i]}) exit=$?"; done
+# The primary host's log is what Step 6 parses.
+cp "/tmp/${JOB_NAME}.w0.log" "/tmp/${JOB_NAME}.log"
 ```
 
-Use a Bash tool call with `timeout: {TIMEOUT * 1000 + 30000}` (ms, plus buffer).
-Even on non-zero exit, proceed to Step 6 — some variants may have printed
-`EVAL_RESULT:` before a later one failed.
+Use a Bash tool call with `timeout: {TIMEOUT * 1000 + 60000}` (ms, plus buffer;
+allow extra for the multi-host init barrier). Even on non-zero exit, proceed to
+Step 6 — some variants may have printed `EVAL_RESULT:` before a later one
+failed. A harmless `hugepage_text.cc ... THP` warning line on stderr is normal
+on v6e and does not affect `EVAL_RESULT:` parsing.
+
+For a single-host config (`SSH_HOSTS` has one entry) this reduces to one launch —
+no barrier concern.
 
 ### Step 6: Collect and parse results
 
@@ -174,7 +210,9 @@ for vdir in [d for d in os.listdir(variants_dir) if os.path.isdir(os.path.join(v
 ### Step 7: Pull artifacts back (scp)
 
 For each variant whose `eval_result.json` has `metadata.artifacts_local_dir`,
-scp the contents of that remote dir into the local variant dir:
+scp the contents of that remote dir into the local variant dir. Pull from the
+PRIMARY only — every host wrote identical artifacts for its own local run, so
+one copy is enough:
 
 ```bash
 for VARIANT_DIR in iteration_N/variants/*/; do
@@ -183,12 +221,16 @@ for VARIANT_DIR in iteration_N/variants/*/; do
   [ -f "$RESULT_FILE" ] || continue
   REMOTE_ART_DIR=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('metadata') or {}).get('artifacts_local_dir',''))" "$RESULT_FILE")
   if [ -n "$REMOTE_ART_DIR" ]; then
-    $SCP "${SSH_USER}@${SSH_HOST}:${REMOTE_ART_DIR}/." "${VARIANT_DIR}" 2>/dev/null && \
+    scp_from "$PRIMARY" "${REMOTE_ART_DIR}/." "${VARIANT_DIR}" 2>/dev/null && \
       echo "pulled artifacts for ${VARIANT_NAME}" || \
       echo "artifact pull skipped for ${VARIANT_NAME}"
   fi
 done
 ```
+
+Note: `trace_events.json` can be tens of MB per variant. If bandwidth or disk is
+a concern, the analyze/profile-brief skills work from `llo_final.txt` +
+`eval_result.json` alone, so the trace file is optional.
 
 This downloads up to three files per variant:
 - `hlo_post_opt.txt` — post-optimization HLO IR text
@@ -199,11 +241,13 @@ These files are optional. If pull fails, the analyze skill falls back to metrics
 
 ### Step 8: Cleanup
 
-Always clean up remote temp files and the local log:
+Always clean up remote temp files (on EVERY host) and the local logs:
 
 ```bash
-$SSH "rm -rf ${REMOTE_PAYLOAD} ${REMOTE_ART_RUN}"
-rm -f /tmp/${JOB_NAME}.log /tmp/batch_payload.b64
+for H in "${SSH_HOSTS[@]}"; do
+  ssh_h "$H" "rm -rf ${REMOTE_PAYLOAD} ${REMOTE_ART_RUN}"
+done
+rm -f /tmp/${JOB_NAME}.log /tmp/${JOB_NAME}.w*.log /tmp/batch_payload.b64
 ```
 
 ## Error Handling
@@ -213,7 +257,8 @@ rm -f /tmp/${JOB_NAME}.log /tmp/batch_payload.b64
 - If a variant has no matching `EVAL_RESULT:` in the log: save a synthetic COMPILE_ERROR for that variant.
 - Partial results are acceptable — some variants may succeed while others fail.
 - Always run the cleanup step regardless of outcome.
-- SSH host key / auth failures: verify `ssh_key` path and that the current `ssh_host` is the live worker IP (IPs go stale; re-discover with gcloud if needed).
+- SSH host key / auth failures: verify `ssh_key` path and that every IP in `ssh_hosts` (or `ssh_host`) is a live worker (IPs go stale on stop/start; re-discover all workers with `gcloud compute tpus tpu-vm describe <name> --zone <z> --format="value(networkEndpoints[].accessConfig.externalIp)"`).
+- Hang with no output near the start: the run is stuck on the libtpu ICI barrier — a host in `ssh_hosts` is unreachable or was not co-launched. Confirm all hosts started (check each `/tmp/${JOB_NAME}.w*.log`).
 
 ### Step 9: Context note
 

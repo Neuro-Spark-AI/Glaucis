@@ -32,11 +32,35 @@ Execute these steps in order:
 
 4. **Read reference kernel**: Read the reference implementation. This is the correctness baseline.
 
-5. **Read AGENT.md**: Read `/AGENT.md` at the repo root (if it exists). This contains accumulated learnings:
+5. **Read AGENT.md**: Read the learnings file at `{session.agent_md_path}` (default `AGENT.md` at the repo root; for private kernels this points into a private-repo checkout). If it exists, it contains accumulated learnings:
    - `## Failure Patterns` — known errors and how to avoid them. **You MUST avoid these.**
    - `## Successful Optimizations` — proven strategies. **Prioritize these.**
 
-6. **Check SSH and baseline**: Verify connectivity to the TPU-VM and that it sees the TPU: `ssh -i {evaluator.ssh_key} {evaluator.ssh_user}@{evaluator.ssh_host} "{evaluator.ssh_python} -c 'import jax; print(jax.devices())'"` (should list TPU devices; if the host is unreachable, the worker IP may be stale — re-discover with gcloud). Then verify baseline profiling exists:
+6. **Check SSH and baseline**: Verify connectivity to the TPU-VM(s).
+
+   **Single-host slice** (`evaluator.ssh_host`, or `ssh_hosts` with one entry):
+   ```bash
+   ssh -i {ssh_key} {ssh_user}@{host} "{ssh_python} -c 'import jax; print(jax.devices())'"
+   ```
+
+   **Multi-host slice** (`evaluator.ssh_hosts` with >1 entry, e.g. v6e-16): a
+   single-host `jax.devices()` HANGS on the ICI init barrier — it can only
+   succeed when all hosts start together. Co-launch the check on every host and
+   wait for all:
+   ```bash
+   SSH_HOSTS=( {space-separated evaluator.ssh_hosts} )
+   pids=()
+   for H in "${SSH_HOSTS[@]}"; do
+     ssh -i {ssh_key} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 \
+       {ssh_user}@"$H" "{ssh_python} -c 'import jax; print(jax.process_index(), jax.devices()[0].device_kind, len(jax.devices()))'" </dev/null &
+     pids+=($!)
+   done
+   for p in "${pids[@]}"; do wait "$p"; done
+   ```
+   Every host should print its process index, device kind (`TPU v6 lite`), and
+   global device count. If it hangs, a worker IP is stale or unreachable —
+   re-discover all workers with gcloud (see the submit skill's error-handling
+   note). Then verify baseline profiling exists:
 
    ```bash
    ls kernel-evolve/examples/kernels/{kernel_name}_baseline/eval_result.json
@@ -48,14 +72,20 @@ Execute these steps in order:
    - "Step-by-step" — pause after each round for user review and direction
    - "Autonomous" — run continuously until a termination condition is met
 
-8. **Create GitHub Issue**: Run:
+8. **Create GitHub Issue**: Create the tracking Issue in the tracking repo. If
+   `session.tracking_repo` is set, pass `--repo {session.tracking_repo}` so
+   tracking lands there (use this for private kernels — the current checkout may
+   be a PUBLIC engine fork, and the Issue will contain variant code/results).
+   If unset, omit `--repo` to use the current repo.
    ```bash
    gh issue create \
+     ${TRACKING_REPO:+--repo "$TRACKING_REPO"} \
      --title "[pallas-evolve] Optimize {kernel_name}" \
      --body "Optimizing {kernel_name} kernel for TPU v6e (batch evolution).\n\nConfig: {config_path}\nShapes: {shapes}\nMax iterations: {max_iterations}\nVariants per round: {variants_per_round}\nTop-K: {top_k}" \
      --label pallas-evolve
    ```
-   Save the issue number from the output.
+   (`TRACKING_REPO="{session.tracking_repo}"`; the `--label` may need the label
+   to exist in that repo, or drop it.) Save the issue number from the output.
 
 9. **Initialize run directory**: Create `kernel-evolve/{output_dir}_{YYYYMMDD_HHMMSS}/`:
    - Copy the config YAML as `config.yaml`
@@ -271,20 +301,33 @@ When the loop terminates:
 
 1. **Report final results**: For each lineage, report its best speedup, direction, and evolution history. Highlight the overall best lineage.
 
-2. **Create PR from best lineage**: If the best lineage's speedup > 1.0:
-   - Identify the best lineage from `lineages.json` (highest `best_speedup`)
-   - Read its `best_kernel` file
-   - Create a branch: `git checkout -b pallas-evolve/{kernel_name}-{timestamp}`
-   - Copy the best lineage's kernel to the template kernel path
-   - Commit and push
-   - Create PR:
+2. **Ship the best lineage**: If the best lineage's speedup > 1.0, identify it
+   from `lineages.json` (highest `best_speedup`) and read its `best_kernel` file.
+   How you ship it depends on `session.tracking_repo`:
+
+   **`tracking_repo` set (private kernels — the common case here).** The current
+   checkout is a PUBLIC engine fork; NEVER commit or push the optimized kernel to
+   it. Instead:
+   - Write the winning kernel to `{output_dir}/best/{kernel_name}.py` (this path
+     is gitignored in the public fork).
+   - Open the PR against the private tracking repo (which owns the kernel source):
      ```bash
-     gh pr create \
+     gh pr create --repo "$TRACKING_REPO" \
        --title "[pallas-evolve] {kernel_name}: 1.0x -> {best_speedup}x" \
        --body "Optimized via pallas-evolve batch evolution.\n\nBest lineage: {lineage_id} ({direction})\nRounds: {total_rounds}\nVariants evaluated: {total_variants}\n\nSee #{issue_number} for iteration history."
      ```
+     Creating the PR needs the winning kernel committed on a branch IN the
+     tracking repo — do that from a checkout of the tracking repo (copy
+     `{output_dir}/best/{kernel_name}.py` over the kernel's template file there,
+     branch, commit, push), then run the `gh pr create --repo`. If no tracking-repo
+     checkout is available, skip the PR and just report the path to the winning
+     kernel + post it as a final Issue comment (below).
 
-3. **Close the GitHub Issue** with a final summary comment including:
+   **`tracking_repo` unset (single public repo, original behavior).** Branch off
+   the current repo, copy the winner to the template path, commit, push, and
+   `gh pr create` (no `--repo`).
+
+3. **Close the GitHub Issue** (in `$TRACKING_REPO` if set: `gh issue close {issue_number} --repo "$TRACKING_REPO"`) with a final summary comment including:
    - Best speedup achieved and which lineage/direction
    - Total rounds and variants evaluated
    - Final lineage table with all active and pruned lineages

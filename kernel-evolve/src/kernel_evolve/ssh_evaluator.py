@@ -3,12 +3,22 @@
 Drop-in alternative to KubeEvaluator for TPU-VM setups (e.g. a v6e-16 slice)
 that have no GKE cluster. Instead of a K8s Job + ConfigMap + GCS bucket, this:
 
-  1. writes the base64 payload to a remote temp file (piped over ssh),
-  2. runs `docker/evaluate.py` on the VM with the v6e roofline env + IR dump
-     flags (evaluate.py sets its own dump flags and preserves existing env),
-  3. parses `EVAL_RESULT:` lines from stdout (same wire format as KubeEvaluator),
+  1. writes the base64 payload to a remote temp file on every host (piped over ssh),
+  2. co-launches `docker/evaluate.py` on all hosts with the v6e roofline env + IR
+     dump flags (evaluate.py sets its own dump flags and preserves existing env),
+  3. parses `EVAL_RESULT:` lines from the primary host's stdout (same wire format
+     as KubeEvaluator),
   4. scp's artifacts (llo_final.txt / hlo_post_opt.txt / trace_events.json) back
-     from ARTIFACTS_LOCAL_DIR on the VM — no GCS involved.
+     from ARTIFACTS_LOCAL_DIR on the primary host — no GCS involved.
+
+Multi-host slices: a v6e-16 is 4 hosts sharing one ICI domain. libtpu does a
+slice-wide init barrier, so evaluate.py MUST be co-launched on every host at
+once — a single-host invocation hangs forever waiting for its peers. Set
+`hosts` to all worker IPs; the first is the primary (its stdout + artifacts are
+the result). The kernel template is single-device, so each host independently
+runs the same kernel on its local chip and prints an identical EVAL_RESULT; we
+just read the primary's. Single-host slices (v6e-1/-4/-8): leave `hosts` empty
+and set `host`.
 
 The remote VM must have the repo checked out at `remote_repo_dir` and the
 kernel-evolve package installed into `python_bin`'s env
@@ -36,7 +46,10 @@ from kernel_evolve.evaluator import (
 
 @dataclass
 class SSHConfig:
-  host: str
+  host: str = ""
+  # All worker hosts of an ICI slice, co-launched together; the first is the
+  # primary (its stdout + artifacts are the result). Empty → single-host [host].
+  hosts: list[str] = field(default_factory=list)
   user: str = "cloud-user"
   ssh_key: str = ""
   # Where the repo is checked out on the VM (contains kernel-evolve/).
@@ -62,7 +75,20 @@ class SSHConfig:
     "-o", "LogLevel=ERROR",
     "-o", "BatchMode=yes",
     "-o", "ServerAliveInterval=30",
+    "-o", "ConnectTimeout=15",
   )
+
+  def all_hosts(self) -> list[str]:
+    hosts = [h for h in self.hosts if h]
+    if hosts:
+      return hosts
+    return [self.host] if self.host else []
+
+  def primary(self) -> str:
+    hosts = self.all_hosts()
+    if not hosts:
+      raise ValueError("SSHConfig has no host/hosts configured")
+    return hosts[0]
 
 
 class SSHEvaluator(Evaluator):
@@ -76,8 +102,8 @@ class SSHEvaluator(Evaluator):
   def _key_args(self) -> list[str]:
     return ["-i", self._config.ssh_key] if self._config.ssh_key else []
 
-  def _target(self) -> str:
-    return f"{self._config.user}@{self._config.host}"
+  def _target(self, host: str) -> str:
+    return f"{self._config.user}@{host}"
 
   async def _run(self, *args: str, stdin: str | None = None, timeout: int | None = None) -> tuple[str, str, int]:
     proc = await asyncio.create_subprocess_exec(
@@ -96,13 +122,25 @@ class SSHEvaluator(Evaluator):
       return "", f"command timed out after {timeout}s", 124
     return stdout.decode(errors="replace"), stderr.decode(errors="replace"), proc.returncode
 
-  async def _ssh(self, remote_cmd: str, stdin: str | None = None, timeout: int | None = None) -> tuple[str, str, int]:
-    args = ["ssh", *self._key_args(), *self._config.ssh_opts, self._target(), remote_cmd]
+  async def _ssh(self, remote_cmd: str, host: str | None = None,
+                 stdin: str | None = None, timeout: int | None = None) -> tuple[str, str, int]:
+    host = host or self._config.primary()
+    args = ["ssh", *self._key_args(), *self._config.ssh_opts, self._target(host), remote_cmd]
     return await self._run(*args, stdin=stdin, timeout=timeout)
 
-  async def _scp_from(self, remote_path: str, local_path: str) -> tuple[str, str, int]:
+  async def _ssh_all(self, remote_cmd: str, stdin: str | None = None,
+                     timeout: int | None = None) -> dict[str, tuple[str, str, int]]:
+    """Co-launch the same command on every host concurrently (barrier-safe)."""
+    hosts = self._config.all_hosts()
+    results = await asyncio.gather(
+      *(self._ssh(remote_cmd, host=h, stdin=stdin, timeout=timeout) for h in hosts)
+    )
+    return dict(zip(hosts, results))
+
+  async def _scp_from(self, remote_path: str, local_path: str, host: str | None = None) -> tuple[str, str, int]:
+    host = host or self._config.primary()
     args = ["scp", "-r", *self._key_args(), *self._config.ssh_opts,
-            f"{self._target()}:{remote_path}", local_path]
+            f"{self._target(host)}:{remote_path}", local_path]
     return await self._run(*args, timeout=300)
 
   # ── env / command construction ──────────────────────────────────────────
@@ -157,19 +195,23 @@ class SSHEvaluator(Evaluator):
       print(f"Artifact scp for {vid} failed: {stderr.strip()}", file=sys.stderr)
 
   async def _write_payload(self, payload: str, remote_file: str) -> int:
-    _, stderr, rc = await self._ssh(
+    """Stage the payload on every host (no shared FS across an ICI slice)."""
+    results = await self._ssh_all(
       f"mkdir -p {self._config.remote_tmp} && cat > {remote_file}",
       stdin=payload,
       timeout=120,
     )
-    if rc != 0:
-      print(f"Failed to write remote payload: {stderr.strip()}", file=sys.stderr)
+    rc = 0
+    for host, (_, stderr, host_rc) in results.items():
+      if host_rc != 0:
+        print(f"Failed to write payload on {host}: {stderr.strip()}", file=sys.stderr)
+        rc = host_rc
     return rc
 
   async def _cleanup(self, *remote_paths: str) -> None:
     if not self._config.cleanup or not remote_paths:
       return
-    await self._ssh("rm -rf " + " ".join(remote_paths), timeout=60)
+    await self._ssh_all("rm -rf " + " ".join(remote_paths), timeout=60)
 
   # ── public API (parallels KubeEvaluator) ────────────────────────────────
 
@@ -181,16 +223,18 @@ class SSHEvaluator(Evaluator):
     if await self._write_payload(request.encode_b64(), payload_file) != 0:
       return EvalResult.compile_error("Failed to stage payload on remote VM")
 
-    stdout, stderr, rc = await self._ssh(
+    # Co-launch on every host (ICI barrier); read the primary's stdout.
+    all_out = await self._ssh_all(
       self._eval_cmd(payload_file, artifacts_dir), timeout=self._config.timeout
     )
+    stdout, stderr, rc = all_out[self._config.primary()]
     results = self._parse_results(stdout)
     result = results.get(request.variant_id)
 
     if result is None:
       await self._cleanup(payload_file, artifacts_dir)
       tail = (stdout + stderr)[-500:]
-      return EvalResult.compile_error(f"No EVAL_RESULT from remote. Tail: {tail}")
+      return EvalResult.compile_error(f"No EVAL_RESULT from primary host. Tail: {tail}")
 
     await self._pull_artifacts(result)
     await self._cleanup(payload_file, artifacts_dir)
@@ -207,9 +251,10 @@ class SSHEvaluator(Evaluator):
       return BatchEvalResult(results={v["variant_id"]: err for v in batch_request.variants})
 
     timeout = 300 * n + 300
-    stdout, stderr, rc = await self._ssh(
+    all_out = await self._ssh_all(
       self._eval_cmd(payload_file, artifacts_dir), timeout=max(timeout, self._config.timeout)
     )
+    stdout, stderr, rc = all_out[self._config.primary()]
     parsed = self._parse_results(stdout)
 
     results: dict[str, EvalResult] = {}
@@ -230,7 +275,8 @@ def ssh_config_from_evaluator(evaluator: dict, roofline: dict | None = None) -> 
   """Build an SSHConfig from parsed config dicts (evaluator + optional roofline)."""
   r = roofline or {}
   return SSHConfig(
-    host=evaluator["ssh_host"],
+    host=evaluator.get("ssh_host", ""),
+    hosts=[h for h in evaluator.get("ssh_hosts", []) if h],
     user=evaluator.get("ssh_user", "cloud-user"),
     ssh_key=evaluator.get("ssh_key", ""),
     remote_repo_dir=evaluator.get("ssh_remote_repo", "/home/cloud-user/Glaucis"),

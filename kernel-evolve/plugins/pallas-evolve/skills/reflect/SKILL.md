@@ -20,7 +20,7 @@ Read:
 - `iteration_{N}/batch_analysis.md` — comparative analysis across variants
 - `iteration_{N}/selection.md` — lineage selection decisions (promotions, prunings)
 - `iteration_{N}/strategy.md` — the optimization directions attempted this round
-- `AGENT.md` at the repo root — existing learnings
+- the learnings file at `{session.agent_md_path}` (default `AGENT.md` at the repo root) — existing learnings
 
 ### Step 2: Determine learnings across variants
 
@@ -50,7 +50,10 @@ Skip recording if:
 
 ### Step 3: Update AGENT.md (if new learnings)
 
-AGENT.md lives at the **repo root** (`/AGENT.md`). If it doesn't exist, create it with:
+The learnings file lives at `{session.agent_md_path}` (default `AGENT.md` at the
+repo root). For private kernels this should point into a private-repo checkout so
+learnings — which quote kernel code and results — never land in a public engine
+fork. If it doesn't exist, create it with:
 
 ```markdown
 # Pallas Kernel Optimization Agent Knowledge
@@ -89,10 +92,13 @@ Batch all updates into a single AGENT.md write — do not make multiple separate
 
 ### Step 4: Comment on GitHub Issue
 
-Post a batch round summary comment:
+Post a batch round summary comment to the tracking Issue. If
+`session.tracking_repo` is set, pass `--repo {session.tracking_repo}` so the
+comment (which contains variant code/results) lands in the private repo, not a
+public fork:
 
 ```bash
-gh issue comment {issue_number} --body "$(cat <<'EOF'
+gh issue comment {issue_number} ${TRACKING_REPO:+--repo "$TRACKING_REPO"} --body "$(cat <<'EOF'
 ### Round {N} Summary
 
 | Variant | Status | Speedup | Direction | Notable |
@@ -109,12 +115,18 @@ EOF
 
 ### Step 5: Commit AGENT.md changes (if any)
 
-If AGENT.md was modified, create a single commit for all changes from this round:
+If the learnings file was modified, commit it **in the repo that owns it** — the
+one containing `{session.agent_md_path}`. When that path is inside a private-repo
+checkout, commit there; NEVER commit learnings to a public engine fork.
 
 ```bash
-git add AGENT.md
-git commit -m "docs(agent): record learnings from {kernel_name} round {N}"
+AGENT_MD="{session.agent_md_path}"
+git -C "$(dirname "$AGENT_MD")" add "$(basename "$AGENT_MD")"
+git -C "$(dirname "$AGENT_MD")" commit -m "docs(agent): record learnings from {kernel_name} round {N}"
 ```
+
+(If `agent_md_path` is not inside a git checkout you control, skip the commit —
+the file still persists on disk for the next run.)
 
 ### Step 6: Context note
 

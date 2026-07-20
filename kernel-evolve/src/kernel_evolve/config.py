@@ -39,6 +39,14 @@ class EvaluatorConfig(BaseModel):
 
   # --- ssh transport (type: ssh) ---
   ssh_host: str = ""
+  # For a multi-host ICI slice (e.g. v6e-16 = 4 hosts), list EVERY worker's IP.
+  # evaluate.py must be co-launched on all of them at once: the hosts share one
+  # ICI domain and libtpu blocks on a slice-wide init barrier, so a single-host
+  # invocation hangs forever waiting for the peers. Results and artifacts are
+  # collected from the first host in the list (the "primary"); the others run
+  # the same program only to satisfy the barrier. When empty, falls back to the
+  # single-host [ssh_host] (correct for single-host slices: v6e-1/-4/-8).
+  ssh_hosts: list[str] = Field(default_factory=list)
   ssh_user: str = "cloud-user"
   ssh_key: str = ""
   ssh_remote_repo: str = "/home/cloud-user/Glaucis"
@@ -46,6 +54,13 @@ class EvaluatorConfig(BaseModel):
   ssh_remote_tmp: str = "/tmp/kernel_eval"
   ssh_artifacts_dir: str = "/tmp/kernel_eval_artifacts"
   ssh_extra_libtpu_init_args: str = ""
+
+  def resolved_ssh_hosts(self) -> list[str]:
+    """All worker hosts to co-launch on; first is the primary. Falls back to [ssh_host]."""
+    hosts = [h for h in self.ssh_hosts if h]
+    if hosts:
+      return hosts
+    return [self.ssh_host] if self.ssh_host else []
 
 
 class RooflineConfig(BaseModel):
@@ -64,6 +79,15 @@ class TPUConfig(BaseModel):
 class SessionConfig(BaseModel):
   max_iterations: int = 20
   output_dir: str = "runs/default"
+  # GitHub repo (owner/name) for the tracking Issue, reflect comments, and the
+  # final PR. Empty = the current checkout's origin. Set this to a PRIVATE repo
+  # when the kernels are private, so variant code / results / the optimized
+  # kernel never post to a public fork (e.g. a public engine fork like Glaucis).
+  tracking_repo: str = ""
+  # Path to the cross-session learnings file. Default is the repo-root AGENT.md.
+  # Point it at a private-repo checkout for private kernels so learnings don't
+  # land in a public fork.
+  agent_md_path: str = "AGENT.md"
 
 
 class BatchConfig(BaseModel):

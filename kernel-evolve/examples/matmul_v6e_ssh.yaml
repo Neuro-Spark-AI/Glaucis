@@ -21,10 +21,21 @@ correctness:
 
 evaluator:
   type: "ssh"
-  ssh_host: "REPLACE_WITH_WORKER_IP"        # current v6e worker (IPs go stale)
+  # v6e-16 = 4 hosts on one ICI domain. evaluate.py is co-launched on ALL of
+  # them (a single host hangs on the libtpu init barrier); results + artifacts
+  # come from the first (primary). Discover the current external IPs with:
+  #   gcloud compute tpus tpu-vm describe <name> --zone <zone> \
+  #     --format="value(networkEndpoints[].accessConfig.externalIp)"
+  ssh_hosts:                                # IPs go stale on stop/start
+    - "REPLACE_WITH_WORKER_0_IP"
+    - "REPLACE_WITH_WORKER_1_IP"
+    - "REPLACE_WITH_WORKER_2_IP"
+    - "REPLACE_WITH_WORKER_3_IP"
+  # Single-host slice (v6e-1/-4/-8): use ssh_host instead of ssh_hosts.
+  # ssh_host: "REPLACE_WITH_WORKER_IP"
   ssh_user: "cloud-user"
   ssh_key: "/home/shuyang/.ssh/neurospark_cloud-user.sshkey"
-  ssh_remote_repo: "/home/cloud-user/Glaucis"     # checkout on the VM (pip install -e kernel-evolve/)
+  ssh_remote_repo: "/home/cloud-user/Glaucis"     # checkout on each VM (pip install -e kernel-evolve/)
   ssh_python: "/home/cloud-user/tpu-venv/bin/python"
   ssh_remote_tmp: "/tmp/kernel_eval"
   ssh_artifacts_dir: "/tmp/kernel_eval_artifacts"

@@ -597,7 +597,19 @@ correctness:
 
 evaluator:
   type: "ssh"
-  ssh_host: "REPLACE_WITH_WORKER_IP"        # current v6e worker (IPs go stale)
+  # Multi-host slice (e.g. v6e-16 = 4 hosts): list EVERY worker's external IP.
+  # evaluate.py is co-launched on all of them (they share one ICI domain and
+  # block on a slice-wide libtpu barrier); results/artifacts come from the first.
+  # Discover with:
+  #   gcloud compute tpus tpu-vm describe <name> --zone <zone> \
+  #     --format="value(networkEndpoints[].accessConfig.externalIp)"
+  ssh_hosts:                                # IPs go stale on stop/start
+    - "REPLACE_WITH_WORKER_0_IP"
+    - "REPLACE_WITH_WORKER_1_IP"
+    - "REPLACE_WITH_WORKER_2_IP"
+    - "REPLACE_WITH_WORKER_3_IP"
+  # Single-host slice (v6e-1/-4/-8): drop ssh_hosts and set ssh_host instead:
+  # ssh_host: "REPLACE_WITH_WORKER_IP"
   ssh_user: "cloud-user"
   ssh_key: "REPLACE_WITH_SSH_KEY_PATH"
   ssh_remote_repo: "/home/cloud-user/Glaucis"
@@ -739,13 +751,22 @@ print('EVOLVE-BLOCK content OK')
 
 Verify the template kernel compiles and runs on TPU, collect baseline performance metrics and profiling artifacts.
 
-1. **Verify SSH connectivity to the TPU-VM**:
+1. **Verify SSH connectivity to the TPU-VM(s)**:
 
+   Single-host slice:
    ```bash
-   ssh -i {evaluator.ssh_key} {evaluator.ssh_user}@{evaluator.ssh_host} "{evaluator.ssh_python} -c 'import jax; print(jax.devices())'"
+   ssh -i {ssh_key} {ssh_user}@{host} "{ssh_python} -c 'import jax; print(jax.devices())'"
    ```
 
-   Should list TPU devices. If unreachable, **stop with error**: "TPU connectivity required for baseline profiling. Check evaluator.ssh_host (worker IPs go stale — re-discover with gcloud) and evaluator.ssh_key, then re-run."
+   Multi-host slice (`ssh_hosts` with >1 entry): a single-host `jax.devices()`
+   hangs on the ICI barrier. Co-launch the check on every host at once and wait
+   for all (see the `pallas-evolve:start` skill Step 6 for the loop). Each host
+   should print `TPU v6 lite` and the global device count.
+
+   If unreachable or it hangs, **stop with error**: "TPU connectivity required
+   for baseline profiling. Check every IP in evaluator.ssh_hosts (worker IPs go
+   stale — re-discover all workers with gcloud) and evaluator.ssh_key, then
+   re-run."
 
 2. **Create baseline directory**:
 
