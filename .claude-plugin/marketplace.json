@@ -1,0 +1,19 @@
+{
+  "name": "glaucis",
+  "description": "Glaucis — Pallas TPU kernel optimization (pallas-evolve). SSH/v6e fork: evaluates on a TPU-VM over SSH with v6e roofline.",
+  "owner": {
+    "name": "edgexyz"
+  },
+  "plugins": [
+    {
+      "name": "pallas-evolve",
+      "description": "Interactive Pallas TPU kernel optimization via iterative eval-analyze-reflect loop on a TPU-VM (v6e) over SSH. Skills: analyze, init-kernel, profile-brief, reflect, start, submit.",
+      "author": {
+        "name": "edgexyz"
+      },
+      "category": "development",
+      "source": "./kernel-evolve/plugins/pallas-evolve",
+      "homepage": "https://github.com/edgexyz/Glaucis"
+    }
+  ]
+}
