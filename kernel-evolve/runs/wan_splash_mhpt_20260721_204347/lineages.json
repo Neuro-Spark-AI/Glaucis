@@ -1,5 +1,5 @@
 {
-  "round": 2,
+  "round": 3,
   "baseline_speedup": 2.13,
   "overall_best": {
     "variant": "dual_mxu",
@@ -28,5 +28,25 @@
       "status": "INCORRECT"
     }
   ],
-  "note": "block sizes fixed (e2e-optimal per user). dual_mxu batched dot works here (unlike small qkv)."
+  "note": "block sizes fixed (e2e-optimal per user). dual_mxu batched dot works here (unlike small qkv).",
+  "production_validation": {
+    "shape": "[5,86016,128]",
+    "baseline_kern_ms": 58.48,
+    "dual_mxu_kern_ms": 51.84,
+    "dual_mxu_vs_baseline": "1.128x (12.8% faster)",
+    "baseline_vs_ref": "4.76x",
+    "dual_mxu_vs_ref": "5.37x",
+    "note": "dual_mxu win holds and grows at production S (was +9% @ 8192, +12.8% @ 86016)."
+  },
+  "round3": {
+    "base": "dual_mxu 2.327x",
+    "results": {
+      "dual_bkvcompute1024": 2.304,
+      "dual_cast_reduce": 2.3,
+      "dual_exp_reduce": 2.294,
+      "dual_db_kv": "INCORRECT"
+    },
+    "outcome": "no improvement \u2014 micro-opts within ~1% noise, double-buffer (emit_pipeline + make_async_copy) both threw",
+    "no_improvement_rounds": 1
+  }
 }

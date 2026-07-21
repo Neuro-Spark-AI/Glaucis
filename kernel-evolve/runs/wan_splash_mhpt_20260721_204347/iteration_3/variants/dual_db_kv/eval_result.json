@@ -1,0 +1,6 @@
+{
+  "status": "INCORRECT",
+  "variant_id": "dual_db_kv",
+  "error": "Correctness error: Traceback (most recent call last):\n  File \"/home/shuyang/Glaucis/kernel-evolve/docker/evaluate.py\", line 116, in stage_correctness\n    kernel_out = kernel_fn(**shape)\n                 ^^^^^^^^^^^^^^^^^^\n  File \"<string>\", line 249, in optimized_compute\n  File \"<string>\", line 200, in _splash_mhpt_forward\n  File \"/home/shuyang/tpu-venv/lib/python3.12/site-packages/jax/_src/deprecations.py\", line 57, in getattr\n    raise AttributeError(f\"module {module!r} has no attribute {name!r}\")\nAttributeError: module 'jax.experimental.pallas.tpu' has no attribute 'ANY'\n",
+  "max_diff": 0.0
+}
