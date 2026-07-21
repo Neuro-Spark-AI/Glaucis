@@ -630,6 +630,30 @@ def stage_profile_deep(exec_globals, shapes, dump_dir=None):
     if best_file is not None:
       with open(best_file) as fh:
         llo_text = fh.read()
+
+      # Schedule-level tags (.mxu0/.mxu1 per-unit assignment, DMA, double-buffer)
+      # only appear in the post-auto-mxu-assigner "late-finalization" LLO pass,
+      # NOT in best_file (a mosaic/pre-assigner pass). Reading best_file alone made
+      # dual_ratio always 0 (no .mxuN tags -> vmatmul fallback hard-codes mxu1=0).
+      # Pick the finalization pass with the most .mxuN tags as the authoritative
+      # assigned schedule; keep llo_text for VMEM/bundle-density (parse from mosaic).
+      sched_text = llo_text
+      try:
+        fin = [f for f in glob.glob(os.path.join(dump_dir, "llo", "*.txt"))
+               if "finaliz" in os.path.basename(f).lower()]
+        fin.sort(key=os.path.getsize, reverse=True)
+        best_sched, best_tags = None, 0
+        for fp in fin[:8]:
+          t = open(fp, errors="replace").read()
+          n = t.count(".mxu0") + t.count(".mxu1")
+          if n > best_tags:
+            best_sched, best_tags = t, n
+        if best_sched is not None:
+          sched_text = best_sched
+          print(f"LLO: schedule pass has {best_tags} .mxuN tags", file=sys.stderr)
+      except Exception as _e:
+        print(f"LLO: schedule-pass scan skipped: {_e}", file=sys.stderr)
+
       # Log first line and VLIW pattern presence for debugging
       first_line = llo_text.split('\n', 1)[0][:120]
       has_hlomod = 'HloModule' in llo_text[:256]
@@ -655,14 +679,15 @@ def stage_profile_deep(exec_globals, shapes, dump_dir=None):
         )
       if bundle_count > 0:
         vliw_bundle_count = bundle_count
-      # Count MXU operations — multiple naming conventions
-      mxu0_count = len(re.findall(r"\.mxu0\b", llo_text))
-      mxu1_count = len(re.findall(r"\.mxu1\b", llo_text))
-      # v7x MLIR LLO uses llo.vmatmul for MXU ops (not .mxu0/.mxu1)
+      # Count MXU operations per unit from the assigned schedule pass. The
+      # `.mxu0`/`.mxu1` tags are the post-auto-mxu-assigner ground truth.
+      mxu0_count = len(re.findall(r"\.mxu0\b", sched_text))
+      mxu1_count = len(re.findall(r"\.mxu1\b", sched_text))
+      # Last resort for LLO formats without per-unit tags: count total matmul
+      # ops (no unit split available -> report as mxu0).
       if mxu0_count + mxu1_count == 0:
-        vmatmul_count = len(re.findall(r"\bllo\.vmatmul\b", llo_text))
+        vmatmul_count = len(re.findall(r"\bllo\.vmatmul\b", sched_text)) or len(re.findall(r"\bllo\.vmatmul\b", llo_text))
         if vmatmul_count > 0:
-          # MLIR format doesn't distinguish mxu0/mxu1; report total
           mxu0_count = vmatmul_count
           mxu1_count = 0
 
@@ -764,19 +789,22 @@ def stage_profile_deep(exec_globals, shapes, dump_dir=None):
             "max_ops_per_bundle": 0,  # not available in MLIR format
           }
 
-      # DMA analysis
-      dma_cnt = len(re.findall(r"\bdma\.\w+", llo_text))
+      # DMA analysis — read the assigned schedule pass (dma.* / double-buffer
+      # markers are schedule-level, like .mxuN). Fall back to llo_text.
+      _dma_src = sched_text if re.search(r"\bdma\.\w+", sched_text) else llo_text
+      dma_cnt = len(re.findall(r"\bdma\.\w+", _dma_src))
       if dma_cnt == 0:
         # v7x MLIR: count llo.vector_load/llo.vector_store as memory ops
         dma_cnt = (
-          len(re.findall(r"\bllo\.vector_load\b", llo_text))
-          + len(re.findall(r"\bllo\.vector_store\b", llo_text))
+          len(re.findall(r"\bllo\.vector_load\b", _dma_src))
+          + len(re.findall(r"\bllo\.vector_store\b", _dma_src))
         )
       if dma_cnt > 0:
         dma_analysis = {
           "dma_count": dma_cnt,
-          "dma_sync_count": len(re.findall(r"\bdma\.done\.wait\b", llo_text)),
-          "double_buffering": bool(re.search(r"\bsand\.u32\s+1\b", llo_text)),
+          "dma_sync_count": len(re.findall(r"\bdma\.done\.wait\b", _dma_src)),
+          # NOTE: double-buffering marker is heuristic/unverified for v6e LLO.
+          "double_buffering": bool(re.search(r"\bsand\.u32\s+1\b", _dma_src)),
         }
 
       # Special hardware units

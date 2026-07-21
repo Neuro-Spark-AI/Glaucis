@@ -36,3 +36,14 @@
 
 ### [F005] emit_pipeline KV double-buffer rewrite is correctness-fragile (wan_splash_mhpt R2)
 - double_buffer_kv (moved KV loop into pltpu.emit_pipeline, K/V as ANY/HBM refs, m/l/o to scratch) threw at runtime (INCORRECT). The emit_pipeline restructure + accumulator-scratch closure is error-prone; needs careful shape/index-map work and CPU-shape validation before TPU.
+
+### [S002-CORRECTION] "dual_mxu" win is batched-matmul occupancy, NOT dual-MXU (wan_splash_mhpt)
+- dumps-on profile of the dual_mxu variant: dual_ratio STILL 0.0 (mxu0=7680, mxu1=0, same as baseline), bundles 484232 (up from 454888), ILP 1.295 (~same). The 2nd MXU is NOT engaged.
+- Yet it's +9% @ S=8192 and +12.8% @ S=86016 (validated, correct). So the gain is real but comes from folding the 5 per-head small matmuls into ONE batched 3D dot_general → the single MXU is fed more continuously with less per-head scheduling overhead (a runtime occupancy effect the static dual_ratio/bundle metrics don't capture), NOT from using both MXUs.
+- Corrected takeaway: batching independent small matmuls into one large batched matmul improves single-MXU occupancy on large attention. Rename the lever "batched_head_dot". The 2nd MXU (dual_ratio 0) remains an UNTAPPED lever.
+
+### [F006 / CORRECTION] dual_ratio=0 was a PARSER BUG — both MXUs are already ~61% used
+- Ground truth from post-auto-mxu-assigner LLO (late-finalization pass): our single-card wan kernel has .mxu0=5.22M, .mxu1=3.20M → dual_ratio ~0.61. Production ring kernel: .mxu0=1.45M, .mxu1=0.91M → ~0.62. BOTH use both MXUs heavily.
+- The `.mxu0`/`.mxu1` per-unit tags appear ONLY in the post-`auto-mxu-assigner` late-finalization LLO pass. The mosaic-level IR shows `mxu_id=0` (pre-assignment). evaluate.py's stage_profile_deep picks one representative LLO file that is a PRE-assigner pass (no .mxu tags) → falls back to vmatmul count with hard-coded mxu1=0 → always reports dual_ratio=0. This is a measurement artifact, not idle hardware.
+- CORRECTIONS to earlier notes: (a) the 2nd MXU is NOT untapped headroom (S002-CORRECTION's "dual_ratio 0" premise was wrong). (b) dual_mxu's +12.8% is a real occupancy/scheduling win but NOT from waking an idle MXU. (c) the user's memory (both MXUs allocated) is correct AND holds for the single-card extraction too — ring/scan is not required for dual-MXU.
+- Parser fix: aggregate `.mxu0`/`.mxu1` across ALL llo files (or read the post-auto-mxu-assigner pass), don't trust a single pre-assigner file. Also re-verify double_buffering=false the same way (likely another pass-selection artifact).
