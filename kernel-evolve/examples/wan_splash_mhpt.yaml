@@ -1,0 +1,50 @@
+# Wan2.2 DiT splash MHA (mhpt, hpt=5) — production flash-attention kernel from
+# maxdiffusion, extracted single-card for pallas-evolve. Single-host v6e-4 (asia).
+
+kernel:
+  name: "wan_splash_mhpt"
+  template: "kernels/wan_splash_mhpt.py"
+  reference: "kernels/wan_splash_mhpt_ref.py"
+  evolve_markers:
+    start: "# EVOLVE-BLOCK-START"
+    end: "# EVOLVE-BLOCK-END"
+
+shapes:
+  # per-card MHA (CP16 ulysses=8: heads 40/8=5). S must be a multiple of bkv=2048.
+  # Validation shape first; add 1080p per-card [5, 86016, 128] once the port is verified.
+  - { H: 5, S: 8192, D: 128 }
+
+correctness:
+  method: "allclose"
+  rtol: 2e-2
+  atol: 2e-2       # bf16 QKᵀ + base-2 exp over long softmax vs f32 reference
+
+evaluator:
+  type: "ssh"
+  # single-host v6e-4 (asia-northeast1-b); 1 host, no ICI barrier.
+  ssh_hosts:
+    - "34.104.210.57"
+  ssh_user: "shuyang"
+  ssh_key: "/home/shuyang/.ssh/google_compute_engine"
+  ssh_remote_repo: "/home/shuyang/Glaucis"
+  ssh_python: "/home/shuyang/tpu-venv/bin/python"
+  ssh_remote_tmp: "/tmp/kernel_eval"
+  ssh_artifacts_dir: "/tmp/kernel_eval_artifacts"
+  timeout: 2400
+
+roofline:                     # TPU v6e (Trillium)
+  peak_flops: 918.0e12
+  peak_hbm_bw: 1759.0e9
+  hbm_capacity_gb: 32.0
+  vmem_capacity_mib: 128.0
+
+batch:
+  variants_per_round: 4
+  top_k: 2
+  max_active_lineages: 3
+
+session:
+  max_iterations: 6
+  output_dir: "runs/wan_splash_mhpt"
+  tracking_repo: "edgexyz/Glaucis"
+  agent_md_path: "kernel-evolve/AGENT.private.md"

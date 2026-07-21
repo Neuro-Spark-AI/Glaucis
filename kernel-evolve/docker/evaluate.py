@@ -1079,7 +1079,8 @@ def main():
     if copied_local:
       print(f"Copied artifacts {copied_local} to {local_variant_dir}", file=sys.stderr)
 
-  gcs_result = upload_to_gcs(job_name, artifacts) if artifacts else {"ok": False, "uploaded": [], "gcs_prefix": ""}
+  _gcs_bucket = os.environ.get("GCS_BUCKET", "glaucis-profiles")
+  gcs_result = upload_to_gcs(job_name, artifacts, bucket_name=_gcs_bucket) if artifacts else {"ok": False, "uploaded": [], "gcs_prefix": ""}
   if gcs_result["ok"]:
     print(f"Uploaded artifacts: {gcs_result['uploaded']} to {gcs_result['gcs_prefix']}", file=sys.stderr)
 
