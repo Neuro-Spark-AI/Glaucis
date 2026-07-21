@@ -1,0 +1,32 @@
+{
+  "round": 2,
+  "baseline_speedup": 2.13,
+  "overall_best": {
+    "variant": "dual_mxu",
+    "speedup": 2.327,
+    "round": 2,
+    "direction": "batched-3D-dot to engage 2nd MXU"
+  },
+  "lineages": [
+    {
+      "id": "L1",
+      "direction": "dual_mxu",
+      "best_speedup": 2.327,
+      "best_kernel": "iteration_2/variants/dual_mxu/kernel.py",
+      "rounds_active": 1,
+      "last_improvement": 2
+    }
+  ],
+  "pruned": [
+    {
+      "variant": "softmax_ilp",
+      "speedup": 2.016,
+      "status": "SUCCESS"
+    },
+    {
+      "variant": "double_buffer_kv",
+      "status": "INCORRECT"
+    }
+  ],
+  "note": "block sizes fixed (e2e-optimal per user). dual_mxu batched dot works here (unlike small qkv)."
+}

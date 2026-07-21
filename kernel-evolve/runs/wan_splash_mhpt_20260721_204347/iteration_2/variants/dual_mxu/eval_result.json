@@ -1,0 +1,67 @@
+{
+  "status": "SUCCESS",
+  "variant_id": "dual_mxu",
+  "fitness": 2.327300358694561,
+  "latency_ms": 1.0133200003110687,
+  "speedup": 2.327300358694561,
+  "flops": 0.0,
+  "compute_ratio": null,
+  "memory_transfer_ratio": null,
+  "metadata": {
+    "reference_latency_ms": 2.358300000196323,
+    "reference_perf_ok": true,
+    "profile_diagnostics": {},
+    "hw_utilization": null,
+    "profile": {
+      "ok": true,
+      "vliw_bundle_count": null,
+      "mxu_utilization": null,
+      "hbm_bandwidth_bytes": null,
+      "flops": null,
+      "arithmetic_intensity": null,
+      "vmem_allocation": null,
+      "vmem_utilization_pct": null,
+      "bundle_density": null,
+      "dma_analysis": null,
+      "fusion_analysis": null,
+      "special_units": null,
+      "hbm_capacity_utilization_pct": 0.12226998805999756
+    },
+    "benchmark": {
+      "lower_time_ms": 49.47134000030928,
+      "compile_time_ms": 17588.296696000725,
+      "evaluation_times_ms": [
+        1.0297999997419538,
+        1.0133200003110687,
+        1.0102500000357395,
+        1.0107099997185287,
+        1.0147900002266397
+      ],
+      "peak_memory_mb": 40.0654296875,
+      "median_ms": 1.0133200003110687,
+      "min_ms": 1.0102500000357395,
+      "max_ms": 1.0297999997419538,
+      "stddev_ms": 0.00720940653929888,
+      "cv": 0.0071146395384338,
+      "timing_source": "wallclock"
+    },
+    "reference_benchmark": {
+      "lower_time_ms": 65.87644899991574,
+      "compile_time_ms": 21069.525566000266,
+      "evaluation_times_ms": [
+        2.3598300003868644,
+        2.332080000087444,
+        2.368700000261015,
+        2.3382800000035786,
+        2.358300000196323
+      ],
+      "peak_memory_mb": 180.00341796875,
+      "median_ms": 2.358300000196323,
+      "min_ms": 2.332080000087444,
+      "max_ms": 2.368700000261015,
+      "stddev_ms": 0.01388059432963212,
+      "cv": 0.005885847571757874,
+      "timing_source": "wallclock"
+    }
+  }
+}
