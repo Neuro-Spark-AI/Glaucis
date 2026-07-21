@@ -891,11 +891,17 @@ def stage_profile_deep(exec_globals, shapes, dump_dir=None):
 
 
 def _get_dump_dir() -> str:
-  """Return variant-specific dump dir when VARIANT_ID is set, else default."""
+  """Return variant-specific dump dir when VARIANT_ID is set, else default.
+
+  Override the base with EVAL_DUMP_DIR (e.g. a RAM-backed tmpfs like /dev/shm
+  or /mnt/wram) to avoid filling the root disk — the per-variant IR dump is
+  ~15 GB and a full disk aborts later variants with RESOURCE_EXHAUSTED.
+  """
+  base = os.environ.get("EVAL_DUMP_DIR", "/tmp/ir_dumps")
   variant_id = os.environ.get("VARIANT_ID", "")
   if variant_id:
-    return f"/tmp/ir_dumps/{variant_id}"
-  return "/tmp/ir_dumps"
+    return f"{base}/{variant_id}"
+  return base
 
 
 def _setup_dump_env():
@@ -907,7 +913,16 @@ def _setup_dump_env():
 
   When VARIANT_ID env var is set (batch subprocess mode), dumps go to
   a variant-specific subdirectory to avoid cross-variant file conflicts.
+
+  Set EVAL_DISABLE_DUMPS=1 to skip IR dumping entirely (no HLO/Mosaic/LLO on
+  disk). Deep profiling then returns ok:false (no files); correctness and
+  benchmark latency are unaffected. Use this on small VMs where the per-variant
+  IR dump (~15 GB) can fill the disk — a full disk aborts later variants with
+  RESOURCE_EXHAUSTED and can hang the primary past its timeout.
   """
+  if os.environ.get("EVAL_DISABLE_DUMPS", "") == "1":
+    return
+
   dump_dir = _get_dump_dir()
   os.makedirs(f"{dump_dir}/hlo", exist_ok=True)
   os.makedirs(f"{dump_dir}/llo", exist_ok=True)
