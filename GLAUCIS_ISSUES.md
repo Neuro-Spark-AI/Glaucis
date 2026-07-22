@@ -114,18 +114,12 @@
 
 机制:加速来自单个 MXU 的 occupancy 提升,即 batched 大矩阵乘比 5 个串行小矩阵乘把 MXU 喂得更连续(流水更满)。两个 MXU 本就均衡(profiler 修好后 dual_ratio ~1.0),与第二个 MXU 的调度无关。可直接搬回生产 `flash_attention_kernel_mhpt`(逐头数学不变,mask/segment_ids/ring 残差不受影响)。细节与移植说明见 `kernel-evolve/runs/wan_splash_mhpt_20260721_204347/best/WINNER.md`。
 
-## 五、使用体验 / 流程意见(给工具作者/协作方)
+## 五、使用体验
 
 1. 每轮优化方向的决策频率过高。一轮是 PROFILE→THINK→SUBMIT→ANALYZE→REFLECT,现在每轮结束都要人确认"下一轮攻哪个方向、是否继续",而方向本可以直接从 profile brief 派生。这次三轮里每轮开头都停下来对齐方向,打断节奏、拉长总时长。建议 loop 默认自主:从 profile brief 派生 N 个方向、跑完直接进下一轮、用停滞规则(连续若干轮无改进)自然收敛,只在真正的岔路(已收敛、要花钱/开云资源、换 kernel 或 shape)才找人。start skill 已有 step-by-step / autonomous 两档,autonomous 档应真正做到"方向自派 + 连续跑",不再逐轮请示。
 
-2. 先信 profile 再动手。dual_ratio 假 0 的 bug(见 1.1)一度把一整轮方向带偏,去"激活"其实没闲的第二个 MXU。loop 在用 profile 指标派方向前应做一次 sanity 校验(例如 dual_ratio 对着 finalization pass 交叉核对),否则会朝幻影优化。
+2. 反馈延迟。一轮的时间主要花在评测,而评测里 dumps-on 的 deep profile 解析(几万个 LLO 小文件、每变体几分钟)是大头;dumps-off 每变体秒级(约 36s 含编译)。这次多次因为 dumps-on 把 900s 的 ssh 超时撑爆、要拉到 2400s。deep profile 是给"下一轮派方向"用的,一轮取一次(baseline)就够,不必每个变体都付。建议 loop 内层迭代默认 dumps-off(只要 speedup + correctness 排名),只在 round-0 baseline 和最终赢家上开一次 dumps-on 取 deep profile。这样每轮从十几分钟降到几分钟。
 
-3. 反馈延迟。一轮的墙钟主要花在评测,而评测里 dumps-on 的 deep profile 解析(几万个 LLO 小文件、每变体几分钟)是大头;dumps-off 每变体秒级(约 36s 含编译)。这次多次因为 dumps-on 把 900s 的 ssh 超时撑爆、要拉到 2400s。deep profile 是给"下一轮派方向"用的,一轮取一次(baseline)就够,不必每个变体都付。建议 loop 内层迭代默认 dumps-off(只要 speedup + correctness 排名),只在 round-0 baseline 和最终赢家上开一次 dumps-on 取 deep profile。这样每轮从十几分钟降到几分钟。
+3. 正确性容差。bf16 kernel 对 f32 参考天然有偏差,默认 allclose(rtol/atol 1e-2)偏紧,会把数值正确的变体误判 INCORRECT。
 
-4. 区分噪声与改进。R3 几个变体落在 ±1% 内,是噪声不是名次差。建议 benchmark 报 CV 或多次取样,把落在噪声内的 delta 标出来,人和 loop 都别追噪声。
-
-5. speedup 口径稀释。fitness 比的是整个 `optimized_compute` vs 整个 reference;当被优化的 kernel 只占其中一小块(如 qkv 里 QKV/输出投影占大头),再好的核心改动也被稀释、看起来没进展。建议提供"只测 kernel 核心"的选项或单独报核心耗时,让 loop 优化到点子上。
-
-6. 正确性容差。bf16 kernel 对 f32 参考天然有偏差,默认 allclose(rtol/atol 1e-2)偏紧,会把数值正确的变体误判 INCORRECT。建议按 kernel dtype 给 bf16-aware 的默认容差或提示。
-
-7. 建项成本集中在手搓三件套。把一个 kernel 接进 pallas-evolve 的主要人力,在手搓自包含 template(内核体放进 EVOLVE-BLOCK、签名不动)+ 参考实现 + config。init-kernel 只认 primatrix 的 tops/ops 布局(见 2.1),对来自 maxdiffusion、已是单文件的 kernel 用不上;大 seq 还得手写内存安全参考(见 1.4)。这次两个 kernel 都是纯手搓。建议:(a) 一个 `--from-file` 轻量 ingest,吃已自包含的单文件 kernel,自动切 ref/template 并插 EVOLVE-BLOCK;(b) 提供内存安全参考模板(query-blocked / flash-style),避免大 seq 的 einsum 参考 OOM。这两个能把"接一个新 kernel"从半天降到分钟级。
+4. 建项成本集中在手搓三件套。把一个 kernel 接进 pallas-evolve 的主要人力,在手搓自包含 template(内核体放进 EVOLVE-BLOCK、签名不动)+ 参考实现 + config。init-kernel 只认 primatrix 的 tops/ops 布局(见 2.1),对来自 maxdiffusion、已是单文件的 kernel 用不上;大 seq 还得手写内存安全参考(见 1.4)。这次两个 kernel 都是纯手搓。建议:(a) 一个 `--from-file` 轻量 ingest,吃已自包含的单文件 kernel,自动切 ref/template 并插 EVOLVE-BLOCK;(b) 提供内存安全参考模板(query-blocked / flash-style),避免大 seq 的 einsum 参考 OOM。这两个能把"接一个新 kernel"从半天降到分钟级。
