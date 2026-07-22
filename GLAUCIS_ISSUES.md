@@ -122,4 +122,4 @@
 
 3. 正确性容差。bf16 kernel 对 f32 参考天然有偏差,默认 allclose(rtol/atol 1e-2)偏紧,会把数值正确的变体误判 INCORRECT。
 
-4. 建项成本集中在手搓三件套。把一个 kernel 接进 pallas-evolve 的主要人力,在手搓自包含 template(内核体放进 EVOLVE-BLOCK、签名不动)+ 参考实现 + config。init-kernel 只认 primatrix 的 tops/ops 布局(见 2.1),对来自 maxdiffusion、已是单文件的 kernel 用不上;大 seq 还得手写内存安全参考(见 1.4)。这次两个 kernel 都是纯手搓。建议:(a) 一个 `--from-file` 轻量 ingest,吃已自包含的单文件 kernel,自动切 ref/template 并插 EVOLVE-BLOCK;(b) 提供内存安全参考模板(query-blocked / flash-style),避免大 seq 的 einsum 参考 OOM。这两个能把"接一个新 kernel"从半天降到分钟级。
+4. 建项成本集中在手搓三件套。把一个 kernel 接进 pallas-evolve 的主要人力,在手搓自包含 template(内核体放进 EVOLVE-BLOCK、签名不动)+ 参考实现 + config。init-kernel 只认 primatrix 的 tops/ops 布局(见 2.1),对来自 maxdiffusion、已是单文件的 kernel 用不上;大 seq 还得手写内存安全参考(见 1.4)。这次两个 kernel 都是纯手搓。建议:(a) 一个 `--from-file` 轻量 ingest,吃已自包含的单文件 kernel,自动切 ref/template 并插 EVOLVE-BLOCK;(b) 提供内存安全参考模板(query-blocked / flash-style),避免大 seq 的 einsum 参考 OOM。
