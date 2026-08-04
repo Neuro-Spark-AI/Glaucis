@@ -12,3 +12,4 @@ __pycache__/
 /kernel-evolve/examples/pulled_*/
 **/eval_result.tmp
 .venv/
+kernel-evolve/examples/kernels/*_baseline/trace_events.json
