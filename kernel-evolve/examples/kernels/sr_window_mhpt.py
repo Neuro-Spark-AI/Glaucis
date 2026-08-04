@@ -51,8 +51,12 @@ def _make_test_data(H=5, SQ=39600, SKV=79200, D=128):
 
 
 # EVOLVE-BLOCK-START
-# Frame-aligned baseline blocks: BQ | SQ, BKV == LOCAL_FRAME, BKV_COMPUTE | BKV.
-BQ = 1200
+# Baseline blocks. The kv side is frame-aligned (BKV == LOCAL_FRAME, chunk inside one
+# frame of one shard) which only needs a multiple of 8. The q side cannot be: bq is the
+# lane dimension of the output block and Mosaic requires a multiple of 128 there, and
+# 39600 has no such divisor -- so the last q block runs past the array and relies on
+# Pallas partial-block semantics (row-isolated garbage, writes masked).
+BQ = 1024
 BKV = 1800
 BKV_COMPUTE = 600
 BKV_COMPUTE_IN = 200
@@ -161,7 +165,6 @@ def _window_sparse_forward(q, k, v, *, bq, bkv, bkv_compute, bkv_compute_in,
   kv_seq_len = k.shape[1]
   hpt = heads_per_tile
   assert num_q_heads % hpt == 0
-  assert q_seq_len % bq == 0, "frame-aligned baseline: BQ divides SQ"
 
   def q_index_map(h, i, j, *_):
     return (h, i, 0)
