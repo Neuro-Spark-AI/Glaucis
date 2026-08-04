@@ -18,8 +18,8 @@ shapes:
 
 correctness:
   method: "allclose"
-  rtol: 2e-2
-  atol: 2e-2       # bf16 QKᵀ + base-2 exp vs f32 reference
+  rtol: 0.02
+  atol: 0.02       # bf16 QKᵀ + base-2 exp vs f32 reference
 
 evaluator:
   type: "ssh"
