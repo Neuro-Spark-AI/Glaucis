@@ -1,0 +1,55 @@
+# Wan2.2 SR windowed sparse self-attention (mhpt, hpt=5) — the SR DiT kernel from
+# avatar-turbo-edge-repro at tp=8/cp=2: q is one cp shard, keys are the cp-gathered
+# rank-major sequence, window ±(2,3) frames of 1800 local tokens plus last frame.
+# Production splash_attention baseline at these shapes: 32.4 ms/call on v6e.
+# Multi-host v6e-16 (us-east5): co-launch on all 4 workers, first is primary.
+
+kernel:
+  name: "sr_window_mhpt"
+  template: "kernels/sr_window_mhpt.py"
+  reference: "kernels/sr_window_mhpt_ref.py"
+  evolve_markers:
+    start: "# EVOLVE-BLOCK-START"
+    end: "# EVOLVE-BLOCK-END"
+
+shapes:
+  # per-card SR self-attention, cp=2: q shard 39600, gathered kv 79200.
+  - { H: 5, SQ: 39600, SKV: 79200, D: 128 }
+
+correctness:
+  method: "allclose"
+  rtol: 2e-2
+  atol: 2e-2       # bf16 QKᵀ + base-2 exp vs f32 reference
+
+evaluator:
+  type: "ssh"
+  # v6e-16 wan22-v6e16-flex-useast5-20260730, worker 0..3 external IPs.
+  ssh_hosts:
+    - "136.83.50.220"
+    - "136.83.16.215"
+    - "34.162.192.249"
+    - "34.162.57.0"
+  ssh_user: "cloud-user"
+  ssh_key: "/home/shuyang/.ssh/neurospark_cloud-user.sshkey"
+  ssh_remote_repo: "/home/cloud-user/Glaucis"
+  ssh_python: "/home/cloud-user/tpu-venv/bin/python"
+  ssh_remote_tmp: "/tmp/kernel_eval"
+  ssh_artifacts_dir: "/tmp/kernel_eval_artifacts"
+  timeout: 2400
+
+roofline:                     # TPU v6e (Trillium)
+  peak_flops: 918.0e12
+  peak_hbm_bw: 1759.0e9
+  hbm_capacity_gb: 32.0
+  vmem_capacity_mib: 128.0
+
+batch:
+  variants_per_round: 4
+  top_k: 2
+  max_active_lineages: 3
+
+session:
+  max_iterations: 6
+  output_dir: "runs/sr_window_mhpt"
+  tracking_repo: "Neuro-Spark-AI/Glaucis"
+  agent_md_path: "kernel-evolve/AGENT.private.md"

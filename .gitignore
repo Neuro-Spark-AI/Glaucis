@@ -11,3 +11,4 @@ __pycache__/
 /kernel-evolve/artifacts/
 /kernel-evolve/examples/pulled_*/
 **/eval_result.tmp
+.venv/
