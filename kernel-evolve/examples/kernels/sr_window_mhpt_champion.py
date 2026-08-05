@@ -69,14 +69,49 @@ USE_BASE2_EXP = True
 # qf0-2 .. qf0+3, clipped) plus one last-frame slot, per shard. 14 kv fetches per
 # q block instead of 44. Clipping creates duplicate frames at the edges; a scalar
 # predicate skips revisits so each frame contributes exactly once.
-SLOTS = 7
+# Window slots cover the union of windows over the q rows of one block,
+# [qf0-WIN_LEFT, qf1+WIN_RIGHT); with bq <= LOCAL_FRAME a block straddles at most one
+# frame boundary, so qf1 <= qf0+1 and the union spans WIN_LEFT+WIN_RIGHT+1 frames.
+WINDOW_SLOTS = WIN_LEFT + WIN_RIGHT + 1
+SLOTS = WINDOW_SLOTS + (1 if ADD_LAST else 0)
 
 
-def _slot_frame(i, j, bq):
+def _slot_frame(i, j, bq, xp=jnp):
   qf0 = (i * bq) // LOCAL_FRAME
   slot = j % SLOTS
-  frame_win = jnp.clip(qf0 - WIN_LEFT + slot, 0, N_FRAMES - 1)
-  return jnp.where(slot == SLOTS - 1, N_FRAMES - 1, frame_win)
+  frame_win = xp.clip(qf0 - WIN_LEFT + slot, 0, N_FRAMES - 1)
+  return xp.where(slot >= WINDOW_SLOTS, N_FRAMES - 1, frame_win)
+
+
+def _slot_state(i, j, bq, xp=jnp):
+  """Slot geometry for grid step (i, j): frame, whether to run it, and how to mask it.
+
+  Scalar arithmetic only, and the array namespace is a parameter, so the host-side
+  coverage check can walk the same predicate with numpy that the kernel traces with jnp.
+  """
+  qf0 = (i * bq) // LOCAL_FRAME
+  qf1 = (i * bq + bq - 1) // LOCAL_FRAME
+  slot = j % SLOTS
+  k_frame = _slot_frame(i, j, bq, xp)
+  is_window_slot = slot < WINDOW_SLOTS
+  # Edge clipping repeats a frame; visit each exactly once. The last-frame slot is a
+  # revisit only when the window slots themselves already reach the last frame, i.e.
+  # when the highest window frame qf0 - WIN_LEFT + WINDOW_SLOTS - 1 gets there. Testing
+  # one frame earlier drops the reference frame for the two q blocks whose window stops
+  # exactly one short of it, which random-data correctness checks cannot see: 1800 of
+  # 21600 keys go missing and the softmax average moves by ~1e-3.
+  dup_window = is_window_slot & (slot > 0) & (k_frame == _slot_frame(i, j - 1, bq, xp))
+  dup_last = (~is_window_slot) & (qf0 - WIN_LEFT + WINDOW_SLOTS - 1 >= N_FRAMES - 1)
+  visit = ~(dup_window | dup_last)
+  in_window = (k_frame >= qf0 - WIN_LEFT) & (k_frame < qf1 + WIN_RIGHT)
+  is_last = ADD_LAST & (k_frame == N_FRAMES - 1) & (qf0 + WIN_RIGHT < N_FRAMES)
+  # A block is fully allowed when every q row in [qf0, qf1] passes the window test for
+  # this frame, or when it is the last frame: a row either has it in its window
+  # (qf >= L-WIN_RIGHT+1) or takes it as the reference frame (qf <= L-WIN_RIGHT), so the
+  # two cases meet with no gap. Fully allowed blocks skip the element mask entirely.
+  full_window = (qf1 <= k_frame + WIN_LEFT) & (qf0 >= k_frame - WIN_RIGHT + 1)
+  full = full_window | (ADD_LAST & (k_frame == N_FRAMES - 1))
+  return k_frame, visit & (in_window | is_last), full
 
 
 def _window_sparse_kernel_mhpt(
@@ -106,29 +141,10 @@ def _window_sparse_kernel_mhpt(
   q_pos = i * bq + lax.broadcasted_iota(jnp.int32, (1, bq), 1)  # [1, bq]
   q_frame = q_pos // LOCAL_FRAME
 
-  qf0 = (i * bq) // LOCAL_FRAME
-  qf1 = (i * bq + bq - 1) // LOCAL_FRAME
-  slot = j % SLOTS
-  k_frame = _slot_frame(i, j, bq)
-  k_frame_prev = _slot_frame(i, j - 1, bq)
-  is_window_slot = slot < SLOTS - 1
-  # Edge clipping repeats a frame; visit each exactly once. The last-frame slot is
-  # a revisit when the window slots already reach frame N_FRAMES-1.
-  dup_window = is_window_slot & (slot > 0) & (k_frame == k_frame_prev)
-  dup_last = (~is_window_slot) & (qf0 + WIN_RIGHT + 2 >= N_FRAMES)
-  visit = ~(dup_window | dup_last)
-  in_window = (k_frame >= qf0 - WIN_LEFT) & (k_frame < qf1 + WIN_RIGHT)
-  is_last = ADD_LAST & (k_frame == N_FRAMES - 1) & (qf0 + WIN_RIGHT < N_FRAMES)
-
-  # Predicates and the element mask are block-level: with BKV == LOCAL_FRAME every
-  # chunk of a block shares one frame, so they are computed once per grid step
-  # instead of once per chunk -- the scalar unit was saturated at 97.7%.
-  # A block is fully allowed when every q row in [qf0, qf1] passes the window test
-  # for this frame, or when it is the last frame (window rows see it as window,
-  # the rest as reference). Fully allowed blocks skip the element mask entirely;
-  # most (q block, frame) pairs are interior and take this path.
-  full_window = (qf1 <= k_frame + WIN_LEFT) & (qf0 >= k_frame - WIN_RIGHT + 1)
-  full = full_window | (ADD_LAST & (k_frame == N_FRAMES - 1))
+  # Predicates and the element mask are block-level: with BKV == LOCAL_FRAME every chunk
+  # of a block shares one frame, so they are computed once per grid step instead of once
+  # per chunk -- the scalar unit was saturated at 97.7%.
+  k_frame, run, full = _slot_state(i, j, bq)
 
   def _block(masked):
     kf = k_frame
@@ -175,11 +191,11 @@ def _window_sparse_kernel_mhpt(
         l_scratch_ref[h_local] = l_prev
         o_scratch_ref[h_local] = o_prev
 
-  @pl.when(visit & (in_window | is_last) & full)
+  @pl.when(run & full)
   def compute_full():
     _block(masked=False)
 
-  @pl.when(visit & (in_window | is_last) & (~full))
+  @pl.when(run & (~full))
   def compute_partial():
     _block(masked=True)
 
@@ -206,12 +222,8 @@ def _window_sparse_forward(q, k, v, *, bq, bkv, bkv_compute, bkv_compute_in,
     return (h, i, 0)
 
   def kv_index_map(h, i, j, *_):
-    shard = j // SLOTS
-    slot = j % SLOTS
-    qf0 = (i * bq) // LOCAL_FRAME
-    frame_win = jnp.clip(qf0 - WIN_LEFT + slot, 0, N_FRAMES - 1)
-    frame = jnp.where(slot == SLOTS - 1, N_FRAMES - 1, frame_win)
-    return (h, shard * N_FRAMES + frame, 0)
+    # bkv == LOCAL_FRAME, so a kv block index is (shard, frame) in frame units.
+    return (h, (j // SLOTS) * N_FRAMES + _slot_frame(i, j, bq), 0)
 
   def out_index_map(h, i, j, *_):
     return (h, 0, i)
