@@ -1,0 +1,53 @@
+{
+  "baseline": {
+    "latency_ms": 25.354,
+    "note": "mhpt+mask, BQ1024/BKV1800/C600/IN200"
+  },
+  "iteration_1": {
+    "v1_skip_loads": {
+      "latency_ms": 17.314,
+      "status": "SUCCESS",
+      "champion": true
+    },
+    "v4_bq512": {
+      "latency_ms": 19.337,
+      "status": "SUCCESS",
+      "note": "baseline family"
+    },
+    "v2_out_layout": {
+      "latency_ms": 24.064,
+      "status": "SUCCESS"
+    },
+    "v3_whole_frame": {
+      "latency_ms": 26.972,
+      "status": "SUCCESS"
+    }
+  },
+  "iteration_2": {
+    "r2d_v1_bq768": {
+      "latency_ms": 17.742,
+      "status": "SUCCESS"
+    },
+    "r2e_v1_bq2048": {
+      "latency_ms": 17.871,
+      "status": "SUCCESS"
+    },
+    "r2a_v1_bq512": {
+      "latency_ms": 19.97,
+      "status": "SUCCESS"
+    },
+    "r2b_v1_bq512_c360": {
+      "latency_ms": 22.329,
+      "status": "SUCCESS"
+    }
+  },
+  "anchors": {
+    "splash_production": 32.4,
+    "f32_reference": 44.1
+  },
+  "conclusions": [
+    "v1_skip_loads (fetch only window frames, grid 44->14) is the champion: 17.31 ms, 1.87x vs splash",
+    "BQ curve in the v1 family has its minimum at 1024 (512:19.97, 768:17.74, 1024:17.31, 2048:17.87) -- opposite direction to the fetch-all family, where smaller BQ won",
+    "finer compute chunks lose: BKV_COMPUTE 360 is 12% slower than 600 at the same BQ"
+  ]
+}
