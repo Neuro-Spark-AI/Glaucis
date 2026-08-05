@@ -48,6 +48,28 @@
   "conclusions": [
     "v1_skip_loads (fetch only window frames, grid 44->14) is the champion: 17.31 ms, 1.87x vs splash",
     "BQ curve in the v1 family has its minimum at 1024 (512:19.97, 768:17.74, 1024:17.31, 2048:17.87) -- opposite direction to the fetch-all family, where smaller BQ won",
-    "finer compute chunks lose: BKV_COMPUTE 360 is 12% slower than 600 at the same BQ"
-  ]
+    "finer compute chunks lose: BKV_COMPUTE 360 is 12% slower than 600 at the same BQ",
+    "r3b full/partial block split is the new champion at 16.60 ms (1.95x vs splash): interior blocks skip the element mask entirely; the last-frame block is always fully allowed since window rows and reference rows together cover every q row",
+    "the scalar-saturation hypothesis mostly failed: hoisting predicates to block level was neutral (compiler already did it) and hpt=1 hurt (register pressure was not binding; 5x grid steps cost more)",
+    "champion profile: compute_ratio 0.947, MXU 29%, scalar_alu 97.7% utilization -- utilization is not the critical path"
+  ],
+  "iteration_3": {
+    "r3b_full_partial": {
+      "latency_ms": 16.604,
+      "status": "SUCCESS",
+      "champion": true
+    },
+    "r3a_hoist": {
+      "latency_ms": 17.326,
+      "status": "SUCCESS"
+    },
+    "r3d_combo": {
+      "latency_ms": 18.208,
+      "status": "SUCCESS"
+    },
+    "r3c_hpt1": {
+      "latency_ms": 19.036,
+      "status": "SUCCESS"
+    }
+  }
 }
