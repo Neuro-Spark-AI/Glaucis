@@ -199,8 +199,10 @@ def _extract_iteration_times(events, tpu_pid, n_iters=5):
 
 
 def stage_benchmark(exec_globals, shapes, trace_dir="/tmp/xplane_trace", warmup=3, n_iters=5):
-  # A stale trace from a previous variant in the same batch parses as this variant's
-  # latency -- every result in a batch then reports the first variant's number.
+  # A stale trace from a previous variant parses as this variant's latency, and
+  # concurrent evaluators on one host race on a shared path -- so the dir is
+  # per-process-overridable and always cleared first.
+  trace_dir = os.environ.get("TRACE_DIR", trace_dir)
   import shutil
   shutil.rmtree(trace_dir, ignore_errors=True)
   """Merged performance + profile stage using hermetic xprof timing.
