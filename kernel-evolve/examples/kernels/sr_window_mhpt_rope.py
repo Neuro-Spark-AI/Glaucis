@@ -1,6 +1,18 @@
-# Source: kernels/wan_splash_mhpt.py (maxdiffusion flash_attention_kernel_mhpt mirror)
-# plus the frame-window mask from avatar-turbo-edge-repro pallas_sparse_attention.
-"""Wan2.2 SR windowed sparse MHA (mhpt) — template for evolution.
+# Source: sr_window_mhpt_champion (r3b_full_partial) plus in-kernel rope rotation.
+"""Wan2.2 SR windowed sparse MHA with fused rope — template for evolution.
+
+q and k arrive unrotated; four extra inputs carry cos/sin duplicated over interleaved
+pairs ([S, D], table[:, 2i] == table[:, 2i+1]), fetched with the same index maps as q
+and k so a key block and its rotation multipliers always travel together. The q tables
+come pre-multiplied by scale*log2(e), so rotation and softmax scaling fold into one
+pass; rotation is 7 full-width VPU ops (two lane rolls, a parity select, three
+multiply-adds) with no interleaved-pair reshape anywhere.
+
+The q block is rotated once per grid row (at j == 0) into a bf16 scratch; key chunks
+are rotated per visit -- a frame is re-rotated by every q block that can see it, which
+is pure VPU work overlapped against the MXU dots.
+
+Below the fused-rope docstring, everything else is r3b_full_partial unchanged:
 
 Same online-softmax flash kernel as wan_splash_mhpt (bf16 QKᵀ + f32 PV, base-2 exp,
 V1 VPU register tiling), with the SR window mask applied inside the kernel:
@@ -40,14 +52,57 @@ WIN_LEFT = 2
 WIN_RIGHT = 3
 ADD_LAST = True
 
+# The production patch grid at tp=8/cp=2 and the rope frequency ladder (problem spec,
+# frozen; kept identical to sr_window_mhpt_rope_ref).
+GRID_F, GRID_H, GRID_W = 22, 45, 80
+SHARDS = 2
+THETA = 10000.0
+
+
+def _tables(D):
+  import numpy as np
+  c = D // 2
+  inv = THETA ** (-np.arange(0, D, 2, dtype=np.float64) / D)
+  ct = c - 2 * (c // 3)
+  inv_t, inv_h, inv_w = inv[:ct], inv[ct : ct + c // 3], inv[ct + c // 3 :]
+  w_local = GRID_W // SHARDS
+
+  def rank_angles(rank):
+    f = np.arange(GRID_F)[:, None, None, None]
+    y = np.arange(GRID_H)[None, :, None, None]
+    x = np.arange(w_local * rank, w_local * (rank + 1))[None, None, :, None]
+    ang = np.concatenate(
+        [
+            np.broadcast_to(f * inv_t, (GRID_F, GRID_H, w_local, len(inv_t))),
+            np.broadcast_to(y * inv_h, (GRID_F, GRID_H, w_local, len(inv_h))),
+            np.broadcast_to(x * inv_w, (GRID_F, GRID_H, w_local, len(inv_w))),
+        ],
+        axis=-1,
+    )
+    return ang.reshape(GRID_F * GRID_H * w_local, c)
+
+  q_ang = rank_angles(0)
+  kv_ang = np.concatenate([rank_angles(r) for r in range(SHARDS)], axis=0)
+
+  def dup(a):
+    return np.repeat(a, 2, axis=-1).astype(np.float32)
+
+  return (
+      jnp.asarray(dup(np.cos(q_ang))),
+      jnp.asarray(dup(np.sin(q_ang))),
+      jnp.asarray(dup(np.cos(kv_ang))),
+      jnp.asarray(dup(np.sin(kv_ang))),
+  )
+
 
 def _make_test_data(H=5, SQ=39600, SKV=79200, D=128):
-  """Deterministic f32 q [H,SQ,D], k/v [H,SKV,D]. Identical in ref and template."""
+  """Unrotated f32 q/k/v plus rotation tables. Identical in ref and template."""
+  assert SQ == GRID_F * GRID_H * GRID_W // SHARDS and SKV == SQ * SHARDS
   kq, kk, kv = jax.random.split(jax.random.PRNGKey(0), 3)
   q = jax.random.normal(kq, (H, SQ, D), dtype=jnp.float32) * 0.5
   k = jax.random.normal(kk, (H, SKV, D), dtype=jnp.float32) * 0.5
   v = jax.random.normal(kv, (H, SKV, D), dtype=jnp.float32) * 0.5
-  return q, k, v
+  return (q, k, v, *_tables(D))
 
 
 # EVOLVE-BLOCK-START
@@ -115,8 +170,8 @@ def _slot_state(i, j, bq, xp=jnp):
 
 
 def _window_sparse_kernel_mhpt(
-    q_ref, k_ref, v_ref,
-    m_scratch_ref, l_scratch_ref, o_scratch_ref,
+    q_ref, k_ref, v_ref, qcos_ref, qsin_ref, kcos_ref, ksin_ref,
+    m_scratch_ref, l_scratch_ref, o_scratch_ref, qrot_scratch_ref,
     o_ref,
     *,
     mask_value, grid_width, bq, bkv, bkv_compute, bkv_compute_in,
@@ -130,11 +185,23 @@ def _window_sparse_kernel_mhpt(
   _, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
   exp = jnp.exp2 if use_base2_exp else jnp.exp
 
+  def rotate(x, cos2, sin2):
+    # Interleaved-pair rotation without touching the pair layout: for pair (x0, x1),
+    # the partner vector is (-x1, x0), built from two lane rolls and a parity select.
+    xf = x.astype(jnp.float32)
+    even = lax.broadcasted_iota(jnp.int32, xf.shape, xf.ndim - 1) % 2 == 0
+    swap = jnp.where(even, -jnp.roll(xf, -1, axis=-1), jnp.roll(xf, 1, axis=-1))
+    return xf * cos2 + swap * sin2
+
   @pl.when(j == 0)
   def init():
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
     m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
     l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    # Rotate this grid row's q block once; the q tables carry the softmax scale.
+    for h_local in range(heads_per_tile):
+      qrot_scratch_ref[h_local] = rotate(
+          q_ref[h_local], qcos_ref[...], qsin_ref[...]).astype(q_ref.dtype)
 
   # Frame of every q row in this block, and of every key row in one compute chunk.
   # Keys are rank-major: shard offset comes off before the frame is taken.
@@ -159,10 +226,12 @@ def _window_sparse_kernel_mhpt(
       for h_local in range(heads_per_tile):
         m_prev = m_scratch_ref[h_local]
         l_prev = l_scratch_ref[h_local]
-        q = q_ref[h_local]
+        q = qrot_scratch_ref[h_local]
         o_prev = o_scratch_ref[h_local]
 
-        k_chunk = k_ref[h_local, slice_k, :]
+        k_chunk = rotate(
+            k_ref[h_local, slice_k, :], kcos_ref[slice_k, :], ksin_ref[slice_k, :]
+        ).astype(k_ref.dtype)
         qk = lax.dot_general(k_chunk, q, NT_DIM_NUMBERS, preferred_element_type=float32)
         if masked:
           qk = jnp.where(allowed_b, qk, mask_value)
@@ -210,7 +279,8 @@ def _window_sparse_kernel_mhpt(
       o_ref[h_local] = (o_scratch_ref[h_local] * l_inv).astype(o_ref.dtype)
 
 
-def _window_sparse_forward(q, k, v, *, bq, bkv, bkv_compute, bkv_compute_in,
+def _window_sparse_forward(q, k, v, qcos2, qsin2, kcos2, ksin2, *,
+                           bq, bkv, bkv_compute, bkv_compute_in,
                            heads_per_tile, use_base2_exp, vmem_limit_bytes):
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
@@ -228,21 +298,35 @@ def _window_sparse_forward(q, k, v, *, bq, bkv, bkv_compute, bkv_compute_in,
   def out_index_map(h, i, j, *_):
     return (h, 0, i)
 
+  # The tables are 2D; their index maps drop the head coordinate but keep the exact
+  # block arithmetic of their tensor, so multipliers and data always co-travel.
+  def qtab_index_map(h, i, j, *_):
+    return (i, 0)
+
+  def ktab_index_map(h, i, j, *_):
+    return ((j // SLOTS) * N_FRAMES + _slot_frame(i, j, bq, jnp), 0)
+
   in_specs = [
       pl.BlockSpec((hpt, bq, head_dim_qk), q_index_map),
       pl.BlockSpec((hpt, bkv, head_dim_qk), kv_index_map),
       pl.BlockSpec((hpt, bkv, head_dim_v), kv_index_map),
+      pl.BlockSpec((bq, head_dim_qk), qtab_index_map),
+      pl.BlockSpec((bq, head_dim_qk), qtab_index_map),
+      pl.BlockSpec((bkv, head_dim_qk), ktab_index_map),
+      pl.BlockSpec((bkv, head_dim_qk), ktab_index_map),
   ]
   out_shapes = [
       jax.ShapeDtypeStruct((hpt, NUM_SUBLANES, bq), jnp.float32),
       jax.ShapeDtypeStruct((hpt, NUM_SUBLANES, bq), jnp.float32),
       jax.ShapeDtypeStruct((hpt, head_dim_v, bq), jnp.float32),
+      jax.ShapeDtypeStruct((hpt, bq, head_dim_qk), q.dtype),
       jax.ShapeDtypeStruct((num_q_heads, head_dim_v, q_seq_len), q.dtype),
   ]
   out_specs = [
       pl.BlockSpec((hpt, NUM_SUBLANES, bq), lambda *_: (0, 0, 0)),
       pl.BlockSpec((hpt, NUM_SUBLANES, bq), lambda *_: (0, 0, 0)),
       pl.BlockSpec((hpt, head_dim_v, bq), lambda *_: (0, 0, 0)),
+      pl.BlockSpec((hpt, bq, head_dim_qk), lambda *_: (0, 0, 0)),
       pl.BlockSpec((hpt, head_dim_v, bq), out_index_map),
   ]
   grid_width = (kv_seq_len // q_seq_len) * SLOTS  # shards x slots
@@ -263,25 +347,26 @@ def _window_sparse_forward(q, k, v, *, bq, bkv, bkv_compute, bkv_compute_in,
           disable_bounds_checks=True,
           vmem_limit_bytes=vmem_limit_bytes),
       out_shape=out_shapes,
-  )(q, k, v)
+  )(q, k, v, qcos2, qsin2, kcos2, ksin2)
   return all_out[-1]  # [num_q_heads, head_dim_v, q_seq_len]
 
 
 def make_inputs(H=5, SQ=39600, SKV=79200, D=128):
-  """Kernel-ready operands. The scale fold and bf16 casts happen on the torch side of
-  the pipeline, outside the custom call, so they stay outside the timed region too."""
-  q, k, v = _make_test_data(H, SQ, SKV, D)
+  """Kernel-ready operands: bf16 unrotated q/k/v plus the tables, the q tables carrying
+  scale*log2(e) so exp2 in the kernel reproduces the natural scaled softmax. In the
+  pipeline the casts and the one-time table build live outside the custom call."""
+  q, k, v, qcos2, qsin2, kcos2, ksin2 = _make_test_data(H, SQ, SKV, D)
   scale = 1.0 / (D ** 0.5)
-  # base-2 exp in the kernel: pre-scale q by scale*log2(e) so exp2 reproduces
-  # natural softmax with 1/sqrt(d) scaling. The additive mask value is large enough
-  # that the base change does not matter for masked entries.
-  q_scaled = (q * (scale * LOG2E)).astype(jnp.bfloat16) if USE_BASE2_EXP else (q * scale).astype(jnp.bfloat16)
-  return q_scaled, k.astype(jnp.bfloat16), v.astype(jnp.bfloat16)
+  s = scale * LOG2E if USE_BASE2_EXP else scale
+  return (
+      q.astype(jnp.bfloat16), k.astype(jnp.bfloat16), v.astype(jnp.bfloat16),
+      qcos2 * s, qsin2 * s, kcos2, ksin2,
+  )
 
 
-def timed_compute(q, k, v):
+def timed_compute(q, k, v, qcos2, qsin2, kcos2, ksin2):
   out = _window_sparse_forward(
-      q, k, v,
+      q, k, v, qcos2, qsin2, kcos2, ksin2,
       bq=BQ, bkv=BKV, bkv_compute=BKV_COMPUTE, bkv_compute_in=BKV_COMPUTE_IN,
       heads_per_tile=HEADS_PER_TILE, use_base2_exp=USE_BASE2_EXP,
       vmem_limit_bytes=VMEM_LIMIT_BYTES)  # [H, D, SQ]

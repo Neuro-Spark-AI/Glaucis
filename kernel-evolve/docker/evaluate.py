@@ -83,6 +83,21 @@ def _resolve_compute_fn(
   return None
 
 
+def _resolve_timed_pair(exec_globals: dict[str, Any]):
+  """The split benchmark protocol: make_inputs(**shape) -> tuple of arrays, and
+  timed_compute(*arrays) -> result. When a module defines both, the benchmark stage
+  times only timed_compute on pre-materialized inputs -- the legacy protocol jits
+  optimized_compute(**shape) whole, which folds test-data RNG and dtype casts into
+  the measurement (a ~10 ms constant at the sr_window shapes that compresses every
+  fitness ratio toward 1). Correctness still goes through optimized_compute.
+  """
+  fn = exec_globals.get("timed_compute")
+  mk = exec_globals.get("make_inputs")
+  if fn is not None and mk is not None:
+    return fn, mk
+  return None
+
+
 def _has_tpu() -> bool:
   if jax is None:
     return False
@@ -219,18 +234,24 @@ def stage_benchmark(exec_globals, shapes, trace_dir="/tmp/xplane_trace", warmup=
   Falls back to wallclock timing if xprof fails.
   """
   try:
-    kernel_fn = _resolve_compute_fn(exec_globals, allow_reference=True)
-    if kernel_fn is None:
-      return {"ok": False, "error": "No compute function found"}
-
     shape = shapes[0]
-
-    # ── Step 2: Compilation isolation ──
-    static_names = list(shape.keys())
-    jitted = jax.jit(kernel_fn, static_argnames=static_names)
+    call_args = ()
+    pair = _resolve_timed_pair(exec_globals)
+    if pair is not None:
+      kernel_fn, make_inputs = pair
+      call_args = tuple(make_inputs(**shape))
+      jax.block_until_ready(call_args)
+      jitted = jax.jit(kernel_fn)
+    else:
+      kernel_fn = _resolve_compute_fn(exec_globals, allow_reference=True)
+      if kernel_fn is None:
+        return {"ok": False, "error": "No compute function found"}
+      # ── Step 2: Compilation isolation ──
+      static_names = list(shape.keys())
+      jitted = jax.jit(kernel_fn, static_argnames=static_names)
 
     t0 = time.perf_counter()
-    lowered = jitted.lower(**shape)
+    lowered = jitted.lower(*call_args) if call_args else jitted.lower(**shape)
     lower_time_ms = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
@@ -248,7 +269,7 @@ def stage_benchmark(exec_globals, shapes, trace_dir="/tmp/xplane_trace", warmup=
 
     # ── Step 4: Warmup ──
     for _ in range(warmup):
-      out = compiled()
+      out = compiled(*call_args)
       if hasattr(out, "block_until_ready"):
         out.block_until_ready()
 
@@ -270,7 +291,7 @@ def stage_benchmark(exec_globals, shapes, trace_dir="/tmp/xplane_trace", warmup=
         try:
           for _ in range(n_iters):
             t0 = time.perf_counter()
-            out = compiled()
+            out = compiled(*call_args)
             if hasattr(out, "block_until_ready"):
               out.block_until_ready()
             wallclock_times.append((time.perf_counter() - t0) * 1000)
@@ -284,7 +305,7 @@ def stage_benchmark(exec_globals, shapes, trace_dir="/tmp/xplane_trace", warmup=
     if not xprof_ok:
       for _ in range(n_iters):
         t0 = time.perf_counter()
-        out = compiled()
+        out = compiled(*call_args)
         if hasattr(out, "block_until_ready"):
           out.block_until_ready()
         wallclock_times.append((time.perf_counter() - t0) * 1000)

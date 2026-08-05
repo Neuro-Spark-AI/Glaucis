@@ -37,8 +37,13 @@ def _make_test_data(H=5, SQ=39600, SKV=79200, D=128):
     return q, k, v
 
 
-def simple_compute(H=5, SQ=39600, SKV=79200, D=128):
-    q, k, v = _make_test_data(H, SQ, SKV, D)
+def make_inputs(H=5, SQ=39600, SKV=79200, D=128):
+    return _make_test_data(H, SQ, SKV, D)
+
+
+def timed_compute(q, k, v):
+    H, SQ, D = q.shape
+    SKV = k.shape[1]
     shards = SKV // SQ
     scale = 1.0 / (D**0.5)
     outs = []
@@ -55,6 +60,10 @@ def simple_compute(H=5, SQ=39600, SKV=79200, D=128):
         p = jax.nn.softmax(scores, axis=-1)
         outs.append(jnp.einsum("hqk,hkd->hqd", p, v_sel))
     return jnp.concatenate(outs, axis=1)
+
+
+def simple_compute(H=5, SQ=39600, SKV=79200, D=128):
+    return timed_compute(*make_inputs(H, SQ, SKV, D))
 
 
 def reference_fn(**kwargs):
